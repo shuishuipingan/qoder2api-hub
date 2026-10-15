@@ -3619,12 +3619,33 @@ def structured_tool_history_enabled(model="", model_key="", realm="",
     return False
 
 
-def flatten_messages(messages, keep_reasoning=False, structured=False):
+def _message_content(text, imgs, vision):
+    """带图消息的出站 content 形态。
+
+    上游只在 `messages[].content` 的 OpenAI parts 里取图（实测：`image_urls`
+    与 `chat_context.imageUrls` 单写时模型答「没有收到图片」，prompt_tokens
+    与纯文本一致；写进 parts 后 prompt_tokens 2618→3388 且答案正确）。
+    因此视觉模型保留 parts；非视觉模型维持原样（图片只落 image_urls，
+    即改动前的行为，不新增上游拒答面）。
+    """
+    if not (vision and imgs):
+        return text or ""
+    parts = []
+    if text:
+        parts.append({"type": "text", "text": text})
+    for url in imgs:
+        parts.append({"type": "image_url", "image_url": {"url": url}})
+    return parts
+
+
+def flatten_messages(messages, keep_reasoning=False, structured=False,
+                     vision=False):
     """把客户端会话压平成 Qoder 上游可接受的 {role, content} 序列。
 
     返回 (system_text, flat_msgs, images)：
       - 首个 system/developer 消息抽为 system_text（模板 system 的替换源）
-      - user/assistant 原位保留（content 压平为字符串）
+      - user/assistant 原位保留（content 压平为字符串；vision=True 且该轮带图
+        时保留 OpenAI parts 列表，图片只有在这个位置才会被上游读到）
       - tool 结果：structured=True 时保留 {role:"tool", tool_call_id, content}
         （content 恒为空字符串而非 null——task-31 实测 null 会让上游转换层丢掉
         配对的 assistant 消息，DeepSeek/Kimi 直接 provider_error）；
@@ -3711,13 +3732,15 @@ def flatten_messages(messages, keep_reasoning=False, structured=False):
             flat.append(item)
             continue
         if role in ("user", "assistant"):
-            item = {"role": role, "content": text or ""}
+            item = {"role": role,
+                    "content": _message_content(text, imgs, vision)}
             if role == "assistant" and keep_reasoning \
                     and m.get("reasoning_content") is not None:
                 item["reasoning_content"] = m.get("reasoning_content") or ""
             flat.append(item)
         elif role:  # 未知角色一律降级为 user，不静默丢弃
-            flat.append({"role": "user", "content": text or ""})
+            flat.append({"role": "user",
+                         "content": _message_content(text, imgs, vision)})
     return system_text, flat, images
 
 
@@ -3745,9 +3768,11 @@ def build_qoder_body(payload, account, model_key, realm=None):
             model=model, model_key=model_key, realm=r, messages=messages)
     else:
         use_structured = bool(use_structured)
+    # 官方目录元数据提前取（vision 判定要在 flatten 之前拿到）
+    catalog_meta = catalog_meta_for(model_key, r)
     system_text, flat, images = flatten_messages(
         messages, keep_reasoning=is_deepseek_model(model, model_key),
-        structured=use_structured)
+        structured=use_structured, vision=bool(catalog_meta.get("is_vl")))
     # 模板只保留 system 基座（其自带的示例 user 轮次是样例内容，必须丢弃），
     # 真实会话随后追加。
     tmpl_system = [m for m in (body.get("messages") or [])
@@ -3769,6 +3794,9 @@ def build_qoder_body(payload, account, model_key, realm=None):
     for m in reversed(flat):
         if m["role"] == "user" and m.get("content"):
             prompt = m["content"]
+            if isinstance(prompt, list):
+                # 视觉轮次的 content 是 parts 列表，这里只要文本部分
+                prompt = _flatten_content_text(prompt)[0]
             break
 
     nid = str(uuid.uuid4())
@@ -3781,17 +3809,7 @@ def build_qoder_body(payload, account, model_key, realm=None):
     body["aliyun_user_type"] = getattr(account, "user_type", "") or \
         qoder_sign.DEFAULT_USER_TYPE
 
-    # model_config（按出口区域的官方清单取元数据 + 动态 key）
-    catalog_meta = {}
-    for m in qoder_catalog.models_for_realm(r):
-        if m.get("key") == model_key:
-            catalog_meta = m
-            break
-    if not catalog_meta:
-        for m in qoder_catalog.STATIC_INTL_MODELS + qoder_catalog.STATIC_CN_MODELS:
-            if m.get("key") == model_key:
-                catalog_meta = m
-                break
+    # model_config（元数据取自上面已解析的 catalog_meta）
     mc = body.get("model_config") or {}
     mc["key"] = model_key
     mc["display_name"] = catalog_meta.get("display_name") or model_key
