@@ -402,6 +402,34 @@ export OPENAI_API_KEY="你在看板设置中添加并绑定的API_Key"
 ```
 custom freeform 工具（`apply_patch`）自动降级为 function 工具出站、入站还原为 `custom_tool_call`，Codex 工具回路完整可用。
 
+### 图片识别（视觉模型）
+三入口都收标准 OpenAI/Anthropic 图片形态，**图片 URL 支持 `data:` base64 与公网 https 两种**；模型是否具备视觉由官方目录的 `is_vl` 决定（国内区除 `MiniMax-M2.7` 外全部为 `true`），`/v1/models` 的 `capabilities` 里可以直接看。
+
+```bash
+# 1) Chat Completions —— content 写成 parts 数组（最通用，Chatbox/NextChat 就是这个形态）
+curl -s http://127.0.0.1:8790/v1/chat/completions -H "Authorization: Bearer $KEY" -H content-type:application/json -d '{
+  "model": "qfmodel", "max_tokens": 512,
+  "messages": [{"role": "user", "content": [
+    {"type": "text", "text": "图里有什么？一句话。"},
+    {"type": "image_url", "image_url": {"url": "data:image/png;base64,...."}}]}]}'
+
+# 2) Responses —— input_image（注意字段名是 image_url，不是 url）
+curl -s http://127.0.0.1:8790/v1/responses -H "Authorization: Bearer $KEY" -H content-type:application/json -d '{
+  "model": "qfmodel", "input": [{"type": "message", "role": "user", "content": [
+    {"type": "input_text", "text": "图里有什么？"},
+    {"type": "input_image", "image_url": "https://example.com/a.png"}]}]}'
+
+# 3) Anthropic /v1/messages —— image + base64 source
+curl -s http://127.0.0.1:8790/v1/messages -H "x-api-key: $KEY" -H content-type:application/json -d '{
+  "model": "qfmodel", "max_tokens": 512, "messages": [{"role": "user", "content": [
+    {"type": "text", "text": "图里有什么？"},
+    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "...."}}]}]}'
+```
+
+- **多图**：parts 里按顺序写多个 `image_url` 即可，出站顺序保持；多轮会话中历史轮次的图同样保留。
+- **`detail` 字段**（low/high/auto）上游不读，写了不报错也不生效。
+- **怎么确认模型真看到了图**：带图后 `usage.prompt_tokens` 会明显跳涨（实测 2618→3388 量级）；只涨不回答，说明问题在模型侧而不是链路。
+
 ---
 
 ## 五、看板与接口一览
@@ -441,7 +469,7 @@ custom freeform 工具（`apply_patch`）自动降级为 function 工具出站�
 # 本机凭证扫描）
 python _test_qoder.py
 
-# 全量套件（29 个：Python + 前端 JS；--jobs 限并发，--logs 把每套件完整
+# 全量套件（30 个：Python + 前端 JS；--jobs 限并发，--logs 把每套件完整
 # 日志落在可见目录而不是临时目录，CI 与本地同一条命令）
 python tests/run_all.py --jobs 4 --logs suite-logs
 
@@ -493,6 +521,20 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+
+### 未发布
+
+**🐛 问题修复**
+
+- **三入口视觉能力静默失效**：上游只在 `messages[].content` 的 OpenAI parts 里取图，而网关把图片只写进 `image_urls` / `chat_context.imageUrls`（实测这两处单写时模型答「没有收到图片」，`prompt_tokens` 与纯文本完全一致）→ `flatten_messages()` 增加 `vision` 开关，视觉模型且该轮带图时保留 parts 列表，`build_qoder_body()` 用官方目录 `is_vl` 判定后传入；Chat Completions / Responses / Anthropic 三条路径共用同一出站咽喉，一处修复全覆盖。非视觉模型与纯文本消息形态逐字节不变（不新增上游拒答面）。
+
+**🧪 测试**
+
+- 新增 `_test_vision_parts.py`（18 项断言）：命门 parts 形态、非视觉模型不变、纯文本不变、`image_urls` 照旧写入、多图顺序、多轮历史带图、system 抽取、`flatten_messages` 单元层开关矩阵、Responses 与 Anthropic 两入口。
+
+**📖 文档**
+
+- README 补「图片识别（视觉模型）」：三入口可复制的 curl、`data:` 与公网 URL 两种图片来源、多图与历史轮语义、`detail` 字段上游不读、用 `usage.prompt_tokens` 跳涨判断模型是否真收到图。
 
 ### v1.4.0
 
