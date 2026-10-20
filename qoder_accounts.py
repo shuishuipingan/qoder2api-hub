@@ -309,7 +309,7 @@ def run_runtime_info(realm, account_id=""):
         _runtime_info_warn(
             "exec:" + type(exc).__name__,
             "无法执行 %s：%s: %s（组件存在但跑不起来；Docker/alpine 需要 "
-            "gcompat libstdc++ libgcc 兼容层，见 README 已知限制）"
+            "gcompat libstdc++ libgcc 兼容层，见 docs/troubleshooting.md 已知限制）"
             % (exe, type(exc).__name__, exc))
     except Exception as exc:
         # 其它失败（超时 / 输出不是 JSON / 非 OSError 异常）
@@ -1158,7 +1158,7 @@ def _retryable(exc):
 # 现建 opener——没有「首次请求固化」，用户中途开关代理立即生效。
 #
 # 依赖系统代理才能上网的用户：设 HTTPS_PROXY=http://127.0.0.1:7897 即可恢复
-# （README「系统代理（Windows）」节有完整说明）；TUN / fake-ip 型代理（Clash
+# （docs/deployment.md「出口代理」节有完整说明）；TUN / fake-ip 型代理（Clash
 # 等）在网络层透明转发，无需任何设置。
 _PROXY_SCHEMES = (("https", ("HTTPS_PROXY", "https_proxy")),
                   ("http", ("HTTP_PROXY", "http_proxy")),
