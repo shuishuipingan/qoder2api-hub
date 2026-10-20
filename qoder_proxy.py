@@ -5172,6 +5172,18 @@ _CONTENT_POLICY_MARKERS = (
     "SensitiveContent",
 )
 
+# 请求自身的确定性错误（issue #59 跟进）：换号也是同一个请求体，结果不会变。
+# 刻意不含 authentication_error / permission_error——那两类可能是账号级问题
+# （凭证失效/无权限），换号有意义，仍走冷却轮换。
+_REQUEST_FAULT_MARKERS = ("invalid_parameter_error", "invalid_request_error",
+                          '"Range of ') + _CONTENT_POLICY_MARKERS
+
+
+def _is_request_fault(code, detail):
+    """请求自身的确定性错误（413 出站超限/参数非法/内容审核）：换号不改变结果。"""
+    return code == 413 or any(m in (detail or "")
+                              for m in _REQUEST_FAULT_MARKERS)
+
 
 def _is_transient_upstream(code, detail):
     """判断一次上游 HTTP 错误是否属于瞬时故障（可重试）。
@@ -5264,7 +5276,12 @@ def friendly_upstream_error(code, detail):
     if "430" in str(code):
         return ("客户端/网关版本过低（430）：上游要求升级后才能继续。"
                 "请升级到最新版；这不是账号或网络问题。", "version_too_low")
-    # issue #59：出站体积超限（本地拦下，没发出去）\n    if "payload too large" in detail:\n        return ("请求体过大（超过上游 30MB 限制）：网关已在本地拦下、未发送。"\n                "请减少图片数量/尺寸（或改用更小的图）后重试。详情：%s"\n                % detail[:160], "payload_too_large")\n    # issue #38/#51：上游排队 / 资源不足（10605 RESOURCE_LIMIT）
+    # issue #59：出站体积超限（本地拦下，没发出去）
+    if "payload too large" in detail:
+        return ("请求体过大（超过上游 30MB 限制）：网关已在本地拦下、未发送。"
+                "请减少图片数量/尺寸（或改用更小的图）后重试。详情：%s"
+                % detail[:160], "payload_too_large")
+    # issue #38/#51：上游排队 / 资源不足（10605 RESOURCE_LIMIT）
     if "10605" in detail or "isQueued" in detail or "RESOURCE_LIMIT" in detail:
         return ("上游排队中（10605 / RESOURCE_LIMIT）：已按 retryAfterSeconds 等待并重试，"
                 "仍拿不到可用资源。请稍后重试；若频繁出现，说明该模型当前排队严重。"
@@ -5698,7 +5715,12 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
       - 429    ：模型粒度频控 -> 解析 reset 时间做模型冷却换号
       - 418/5xx/provider_error（瞬时上游故障）-> 同账号快速重试 2 次
                 （1s/2s 退避），仍失败短冷却(15s/单账号3s)换号
-      - 其他 4xx（含客户端参数错）-> 快速失败，冷却换号，不重试
+      - 其他 4xx（客户端参数/请求形态问题）-> 快速失败，冷却换号，不重试；
+        其中请求自身的确定性错误（413 出站超限/参数非法/内容审核，见
+        _is_request_fault）换号结果不变：不冷却不换号，直接抛给客户端
+      - 熔断/降权三族记账（note_failure/note_unknown_failure）延迟到同一
+        请求换号成功后才落账：全池同样失败（断网/上游整体故障）不计入，
+        避免网络恢复后全池仍被熔断锁死
     全部账号失败后抛 RateLimited 或最后一个错误。
     """
     model = str(payload.get("model") or "")
@@ -5747,6 +5769,11 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
     last_429 = None
     last_429_detail = ""
     waited_cool = False
+    # 熔断/降权三族（note_failure/note_unknown_failure）先记进 blame，延迟到
+    # 「同一请求换号成功」才落账：全部账号同样失败时（本机断网、上游整体
+    # 故障、超大包被 RST），逐个记账会把全池误打进 30 分钟熔断，网络恢复也
+    # 解不开。换号后成功了，才说明先前失败的账号确实有问题。
+    blame = []                     # [(绑定方法, message)]
 
     # 额外 +2 次迭代预算：只供“短错误冷却等待续上”使用（正常轮换仍由
     # tried 集合自然终止）。
@@ -5876,8 +5903,11 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
                 break
 
         if resp is not None:
-            # task-74 三族：成功收尾 -> 统一复位（三族计数 + 软冷却 + 模型冷却）。
-            # note_success 是 clear_error(model) 的超集；刻意不动 balance_until。
+            # 同一请求换号后成功了：先前失败的账号确实有问题，此刻才落三族账
+            # （喂熔断/降权）。随后统一复位本账号；note_success 是
+            # clear_error(model) 的超集，刻意不动 balance_until。
+            for note, msg in blame:
+                note(msg)
             account.note_success(model=model)
             if _team_lease:
                 # 关闭/退出时自动释放租约（handler 都走 with resp / resp.close）
@@ -5934,10 +5964,11 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
                 account.note_error(
                     "HTTP %s upstream transient: %s" % (exc.code, detail[:80]),
                     cooldown=15, single_account=(total <= 1))
-                # task-74 三族之二：连续硬失败喂熔断计数（3 次才起跳；单号池不接）
+                # task-74 三族之二：延迟记账——同一请求换号成功后才喂熔断
+                # 计数（3 次才起跳；单号池不接）
                 if total > 1:
-                    account.note_failure(
-                        "HTTP %s upstream transient" % exc.code)
+                    blame.append((account.note_failure,
+                                  "HTTP %s upstream transient" % exc.code))
                 log("upstream still transient (HTTP %d) after %d tries on "
                     "'%s' - short cooldown, rotating"
                     % (exc.code, TRANSIENT_MAX_RETRIES + 1, account.uid[:8]),
@@ -5946,6 +5977,15 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
                 continue
             # 其他 4xx（客户端参数/请求形态问题）：快速失败，冷却换号
             if 400 <= exc.code < 500:
+                # issue #59 跟进：请求自身的确定性错误（413 出站超限/参数非法/
+                # 内容审核）换号结果不变——轮换只会把全池冷 60s，其他用户跟着
+                # 吃 503 "no usable account"。直接把原错误抛给客户端。
+                if _is_request_fault(exc.code, detail):
+                    log("request-fault HTTP %s on '%s' model '%s' - request "
+                        "itself is at fault: no rotation, no cooldown"
+                        % (exc.code, account.uid[:8], model),
+                        level="WARN", tag="chat")
+                    raise exc
                 if session_key and POOL:
                     POOL.affinity.unbind(session_key)
                 account.note_error("HTTP %s: %s" % (exc.code, detail[:80]),
@@ -5961,10 +6001,11 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
                     # 传输抖动重试耗尽：短冷却换号（不重罚账号）
                     account.note_error("transport transient: %s" % str(exc)[:100],
                                        cooldown=15, single_account=(total <= 1))
-                    # task-74 三族之二（同族）：传输类连续硬失败喂熔断计数
+                    # task-74 三族之二（同族）：延迟记账——换号成功后才喂熔断计数
                     if total > 1:
-                        account.note_failure("transport transient: %s"
-                                             % type(exc).__name__)
+                        blame.append((account.note_failure,
+                                      "transport transient: %s"
+                                      % type(exc).__name__))
                     log("upstream transport still failing after %d tries on "
                         "'%s' - short cooldown"
                         % (TRANSIENT_MAX_RETRIES + 1, account.uid[:8]),
@@ -5972,12 +6013,19 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
                 else:
                     account.note_error(str(exc)[:120], cooldown=60,
                                        single_account=(total <= 1))
-                    # task-74 三族之三：未知异常 -> 降权窗口（不是不可用）
+                    # task-74 三族之三：延迟记账——换号成功后才进降权窗口
                     if total > 1:
-                        account.note_unknown_failure(str(exc)[:120])
+                        blame.append((account.note_unknown_failure,
+                                      str(exc)[:120]))
                 last_error = exc
             continue
 
+    # 循环耗尽仍未成功：丢弃 blame，不落三族账——所有试过的账号都同样失败，
+    # 更像请求级或网络级故障，不是某个账号的问题。
+    if blame:
+        log("all tried accounts failed on '%s' - request/network level fault, "
+            "not counting toward breaker/downgrade" % model,
+            level="WARN", tag="chat")
     if last_error is not None:
         if last_429 is not None:
             raise RateLimited(last_429, last_429_detail,
