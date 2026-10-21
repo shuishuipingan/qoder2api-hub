@@ -9314,8 +9314,13 @@ class Handler(BaseHTTPRequestHandler):
             n_msg_system=qoder_anthropic.count_msg_system(payload))
         t_start = time.time()
         # ---- 形态决策单点：在这里算唯一一次，随 chat_req 下传 ----
+        # issue #79：realm 未显式指定时（#76 起入口传 None），形态判定必须和
+        # open_upstream 用同一个兜底 —— auto 模式要求 realm == "cn"，None 会让
+        # DeepSeek / Qwen 等白名单永远不生效，历史工具调用回退文本化并被模型复述。
+        _realm_for_shape = (req_realm or detect_model_realm(model)
+                            or CURRENT_REALM)
         chat_req["_qd_structured"] = structured_tool_history_enabled(
-            model=model, model_key=model_key, realm=req_realm,
+            model=model, model_key=model_key, realm=_realm_for_shape,
             messages=chat_req.get("messages"))
         holder = {"usage": None,
                   "allowed_names": _tool_names_from_payload(chat_req)}
