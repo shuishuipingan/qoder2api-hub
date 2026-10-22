@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PYTHON_BIN="${PYTHON_BIN:-/opt/python/cp312-cp312/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-python3.12}"
 VENV_DIR="${VENV_DIR:-/tmp/qoder-pyinstaller-venv}"
 PYINSTALLER_VERSION="${PYINSTALLER_VERSION:-6.22.3}"
 

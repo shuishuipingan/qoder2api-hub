@@ -23,6 +23,8 @@ permissions:
 env:
   PYTHONUTF8: "1"
   PYINSTALLER_VERSION: "6.22.3"
+  PBS_RELEASE: "20261013"
+  PBS_FILE: "cpython-3.12.15+20261013-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
 
 jobs:
   linux-x64:
@@ -51,18 +53,24 @@ jobs:
           fi
           exit 0
 
-      - name: Build with PyInstaller in manylinux2014
+      - name: Prepare glibc 2.17 Python
         run: |
           set -euo pipefail
-          docker run --rm \
-            --user "$(id -u):$(id -g)" \
-            -e HOME=/tmp \
-            -e PIP_DISABLE_PIP_VERSION_CHECK=1 \
-            -e PYINSTALLER_VERSION \
-            -v "$PWD:/src" \
-            -w /src \
-            quay.io/pypa/manylinux2014_x86_64:latest \
-            bash packaging/build_linux_manylinux.sh
+          mkdir -p build-assets
+          curl -fL --retry 5 --retry-delay 2 \
+            "https://registry.npmmirror.com/-/binary/python-build-standalone/${PBS_RELEASE}/${PBS_FILE}" \
+            -o "build-assets/${PBS_FILE}"
+          mkdir -p build-assets/python-linux
+          tar -xzf "build-assets/${PBS_FILE}" \
+            -C build-assets/python-linux --strip-components=1
+          build-assets/python-linux/bin/python3 --version
+          file build-assets/python-linux/lib/libpython3.12.so.1.0
+
+      - name: Build with PyInstaller
+        env:
+          PYTHON_BIN: ${{ github.workspace }}/build-assets/python-linux/bin/python3
+          VENV_DIR: ${{ github.workspace }}/build/pyinstaller-venv-linux
+        run: bash packaging/build_linux.sh
 
       - name: Assemble Linux package
         run: |
