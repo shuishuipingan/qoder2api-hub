@@ -1,0 +1,176 @@
+name: Build Nuitka binary packages
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build-nuitka-binaries.yml"
+      - "packaging/**"
+      - "qoder_*.py"
+      - "dashboard.html"
+      - "baseprompt.json"
+      - "qoder_catalog_*.json"
+      - "README.md"
+      - "LICENSE"
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: "1"
+  NUITKA_VERSION: "4.3.1"
+  PBS_RELEASE: "20261013"
+  PBS_FILE: "cpython-3.12.15+20261013-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
+
+jobs:
+  linux-x64:
+    name: Nuitka Linux x86_64 (glibc 2.17+)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Extract UMID component (optional)
+        continue-on-error: true
+        run: |
+          set +e
+          python _install_umid.py --platform linux --arch x64 --dest build-assets/umid-linux
+          rc=$?
+          if [ "$rc" -eq 0 ] && [ -f build-assets/umid-linux/runtime-info ]; then
+            mkdir -p umid
+            cp -a build-assets/umid-linux/. umid/
+            file umid/runtime-info
+          else
+            echo "::warning title=UMID skipped::Native UMID extraction failed; package will use derived identity fallback."
+          fi
+          exit 0
+
+      - name: Prepare glibc 2.17 Python
+        run: |
+          set -euo pipefail
+          mkdir -p build-assets
+          curl -fL --retry 5 --retry-delay 2 \
+            "https://registry.npmmirror.com/-/binary/python-build-standalone/${PBS_RELEASE}/${PBS_FILE}" \
+            -o "build-assets/${PBS_FILE}"
+          mkdir -p build-assets/python-linux
+          tar -xzf "build-assets/${PBS_FILE}" \
+            -C build-assets/python-linux --strip-components=1
+          build-assets/python-linux/bin/python3 --version
+          file build-assets/python-linux/lib/libpython3.12.so.1.0
+
+      - name: Build with Nuitka
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp \
+            -e PIP_DISABLE_PIP_VERSION_CHECK=1 \
+            -e NUITKA_VERSION \
+            -e PYTHON_BIN=/src/build-assets/python-linux/bin/python3 \
+            -e VENV_DIR=/tmp/qoder-nuitka-venv \
+            -v "$PWD:/src" \
+            -w /src \
+            quay.io/pypa/manylinux2014_x86_64:latest \
+            bash packaging/build_linux_nuitka.sh
+
+      - name: Assemble Nuitka Linux package
+        run: |
+          python packaging/assemble.py \
+            --platform linux \
+            --arch x86_64 \
+            --bundle-dir dist/nuitka-linux/qoder_proxy.dist
+
+      - name: Verify GLIBC floor and smoke test
+        run: |
+          set -euo pipefail
+          STAGE="release/nuitka-linux-x86_64/qoder2api-hub"
+          python packaging/verify_package.py --platform linux --arch x86_64
+          MAX_GLIBC="$(find "$STAGE" -type f \( -name 'qoder2api-hub.bin' -o -name '*.so' -o -name '*.so.*' \) -print0 \
+            | xargs -0 -r objdump -T 2>/dev/null \
+            | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -n1)"
+          echo "max glibc symbol: ${MAX_GLIBC:-none}"
+          if [ -n "$MAX_GLIBC" ]; then
+            HIGHEST="$(printf '%s\n' "$MAX_GLIBC" GLIBC_2.17 | sort -Vu | tail -n1)"
+            test "$HIGHEST" = "GLIBC_2.17"
+          fi
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp \
+            -v "$PWD:/src" \
+            -w /src \
+            quay.io/pypa/manylinux2014_x86_64:latest \
+            bash packaging/smoke_linux.sh \
+              release/nuitka-linux-x86_64/qoder2api-hub/qoder2api-hub
+
+      - name: Upload Nuitka Linux package
+        uses: actions/upload-artifact@v4
+        with:
+          name: qoder2api-hub-nuitka-linux-x86_64
+          path: |
+            release/nuitka-linux-x86_64/*.tar.gz
+            release/nuitka-linux-x86_64/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+
+  windows-x64:
+    name: Nuitka Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Extract UMID component (optional)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          python _install_umid.py --platform win32 --arch x64 --dest build-assets/umid-windows
+          if ($LASTEXITCODE -eq 0 -and
+              (Test-Path "build-assets/umid-windows/runtime-info.exe") -and
+              (Test-Path "build-assets/umid-windows/sgsdk.dll")) {
+            New-Item -ItemType Directory -Force -Path "umid" | Out-Null
+            Copy-Item -LiteralPath "build-assets/umid-windows/runtime-info.exe" -Destination "umid/runtime-info.exe" -Force
+            Copy-Item -LiteralPath "build-assets/umid-windows/sgsdk.dll" -Destination "umid/sgsdk.dll" -Force
+            Get-ChildItem -LiteralPath "umid" | Select-Object Name, Length
+          } else {
+            Write-Host "::warning title=UMID skipped::Native UMID extraction failed; package will use derived identity fallback."
+          }
+
+      - name: Build with Nuitka
+        shell: pwsh
+        run: |
+          .\packaging\build_windows_nuitka.ps1 -NuitkaVersion $env:NUITKA_VERSION
+
+      - name: Assemble Nuitka Windows package
+        shell: pwsh
+        run: |
+          python packaging/assemble.py `
+            --platform windows `
+            --arch x64 `
+            --bundle-dir dist/nuitka-windows/qoder_proxy.dist
+
+      - name: Smoke test Nuitka Windows binary
+        shell: pwsh
+        run: |
+          python packaging/verify_package.py --platform windows --arch x64
+          .\packaging\smoke_windows.ps1 `
+            -Binary "release\nuitka-windows-x64\qoder2api-hub\qoder2api-hub.exe"
+
+      - name: Upload Nuitka Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: qoder2api-hub-nuitka-windows-x64
+          path: |
+            release/nuitka-windows-x64/*.zip
+            release/nuitka-windows-x64/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30

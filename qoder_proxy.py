@@ -3124,8 +3124,13 @@ def requested_effort(payload):
 # ---------------------------------------------------------------------------
 _LAUNCH_ARGV = list(sys.argv)          # 更新后按原参数重启
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
-UPDATE_DISABLED = str(os.environ.get("QD_UPDATE_DISABLE") or "").strip().lower() \
+FROZEN_BINARY = bool(getattr(sys, "frozen", False))
+NUITKA_COMPILED = "__compiled__" in globals()
+COMPILED_BINARY = FROZEN_BINARY or NUITKA_COMPILED
+UPDATE_DISABLED = COMPILED_BINARY or (
+    str(os.environ.get("QD_UPDATE_DISABLE") or "").strip().lower()
     in ("1", "on", "true", "yes", "enable", "enabled")
+)
 _UPDATE_LOCK = threading.Lock()
 
 
