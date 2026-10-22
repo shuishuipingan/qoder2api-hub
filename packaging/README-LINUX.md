@@ -1,7 +1,11 @@
 # Qoder2API Hub binary package for Linux
 
-This package contains a PyInstaller binary and does not require Python.
-The binary is built on manylinux2014 and requires glibc 2.17 or newer.
+This package contains a Nuitka-compiled standalone executable and bundled
+CPython runtime. It does not require an installed Python interpreter.
+It is built for glibc 2.17 or newer.
+
+Keep all extracted files together. The executable depends on the adjacent
+runtime libraries, data files, and UMID component.
 
 ## Direct run
 

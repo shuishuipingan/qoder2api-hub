@@ -1,6 +1,10 @@
 # Qoder2API Hub binary package for Windows
 
-This package contains a PyInstaller executable and does not require Python.
+This package contains a Nuitka-compiled standalone executable and bundled
+CPython runtime. It does not require an installed Python interpreter.
+
+Keep all extracted files together. The executable depends on the adjacent
+runtime DLLs, data files, and UMID component.
 
 ## Run directly
 

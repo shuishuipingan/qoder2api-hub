@@ -32,7 +32,7 @@ def verify_checksum(release_dir: Path, archive: Path) -> None:
         raise SystemExit(f"checksum mismatch: {actual} != {expected_hash}")
 
 
-def verify_linux(archive: Path, engine: str) -> None:
+def verify_linux(archive: Path) -> None:
     required = {
         "qoder2api-hub/qoder2api-hub",
         "qoder2api-hub/qoder2api-hub.sh",
@@ -46,8 +46,7 @@ def verify_linux(archive: Path, engine: str) -> None:
         "qoder2api-hub/data/accounts/README.txt",
         "qoder2api-hub/data/usage/.gitkeep",
     }
-    if engine == "nuitka":
-        required.add("qoder2api-hub/umid/runtime-info")
+    required.add("qoder2api-hub/umid/runtime-info")
     executable = {
         "qoder2api-hub/qoder2api-hub",
         "qoder2api-hub/qoder2api-hub.sh",
@@ -68,19 +67,17 @@ def verify_linux(archive: Path, engine: str) -> None:
             if not (members[name].mode & 0o111):
                 raise SystemExit(f"{name} is not executable: {members[name].mode:o}")
         native_names = (
-            ("qoder2api-hub/qoder2api-hub", "qoder2api-hub/qoder2api-hub.bin")
-            if engine == "nuitka"
-            else ("qoder2api-hub/qoder2api-hub",)
+            "qoder2api-hub/qoder2api-hub",
+            "qoder2api-hub/qoder2api-hub.bin",
         )
         native_name = next((name for name in native_names if name in members), "")
         if not native_name:
             raise SystemExit("Linux native binary is missing")
-        minimum = 1024 * 1024 if engine == "nuitka" else 5 * 1024 * 1024
-        if members[native_name].size < minimum:
+        if members[native_name].size < 1024 * 1024:
             raise SystemExit(f"{native_name} is unexpectedly small")
 
 
-def verify_windows(archive: Path, engine: str) -> None:
+def verify_windows(archive: Path) -> None:
     required = {
         "qoder2api-hub/qoder2api-hub.exe",
         "qoder2api-hub/start-qoder-proxy.bat",
@@ -91,11 +88,10 @@ def verify_windows(archive: Path, engine: str) -> None:
         "qoder2api-hub/data/accounts/README.txt",
         "qoder2api-hub/data/usage/.gitkeep",
     }
-    if engine == "nuitka":
-        required.update({
-            "qoder2api-hub/umid/runtime-info.exe",
-            "qoder2api-hub/umid/sgsdk.dll",
-        })
+    required.update({
+        "qoder2api-hub/umid/runtime-info.exe",
+        "qoder2api-hub/umid/sgsdk.dll",
+    })
     with zipfile.ZipFile(archive) as zf:
         names = set(zf.namelist())
         missing = sorted(required - names)
@@ -126,12 +122,9 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--platform", choices=("linux", "windows"), required=True)
     parser.add_argument("--arch", required=True)
-    parser.add_argument("--engine", choices=("pyinstaller", "nuitka"), default="pyinstaller")
     args = parser.parse_args()
 
-    release_slug = f"{args.platform}-{args.arch}"
-    if args.engine == "nuitka":
-        release_slug = f"nuitka-{release_slug}"
+    release_slug = f"nuitka-{args.platform}-{args.arch}"
     release_dir = ROOT / "release" / release_slug
     suffix = ".tar.gz" if args.platform == "linux" else ".zip"
     archives = sorted(release_dir.glob(f"qoder2api-hub-*{suffix}"))
@@ -143,11 +136,11 @@ def main() -> int:
     if args.platform == "linux":
         with tarfile.open(archive, "r:gz") as tar:
             verify_clean_entries({member.name for member in tar.getmembers()})
-        verify_linux(archive, args.engine)
+        verify_linux(archive)
     else:
         with zipfile.ZipFile(archive) as zf:
             verify_clean_entries(set(zf.namelist()))
-        verify_windows(archive, args.engine)
+        verify_windows(archive)
 
     print(f"verified: {archive}")
     print(f"sha256: {sha256(archive)}")

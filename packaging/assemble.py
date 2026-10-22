@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Assemble a PyInstaller binary into a quick-deploy package."""
+"""Assemble a Nuitka standalone bundle into a quick-deploy package."""
 
 from __future__ import annotations
 
@@ -111,51 +111,38 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--platform", choices=("linux", "windows"), required=True)
     parser.add_argument("--arch", required=True)
-    parser.add_argument("--engine", choices=("pyinstaller", "nuitka"), default="pyinstaller")
-    parser.add_argument("--binary")
-    parser.add_argument("--bundle-dir")
+    parser.add_argument("--bundle-dir", required=True)
     args = parser.parse_args()
 
     version = read_version()
     platform_slug = f"{args.platform}-{args.arch}"
-    release_slug = platform_slug if args.engine == "pyinstaller" else f"nuitka-{platform_slug}"
+    release_slug = f"nuitka-{platform_slug}"
     release_dir = ROOT / "release" / release_slug
     stage = release_dir / PACKAGE_NAME
     reset_dir(stage)
 
-    if args.engine == "nuitka":
-        if not args.bundle_dir:
-            raise SystemExit("--bundle-dir is required for Nuitka packages")
-        bundle_dir = Path(args.bundle_dir).resolve()
-        if not bundle_dir.is_dir():
-            raise SystemExit(f"Nuitka bundle directory not found: {bundle_dir}")
-        shutil.copytree(bundle_dir, stage, dirs_exist_ok=True)
-        if args.platform == "linux":
-            native_bin = stage / f"{PACKAGE_NAME}.bin"
-            if native_bin.is_file():
-                launcher = stage / PACKAGE_NAME
-                launcher.write_bytes(
-                    b"#!/bin/sh\nexec \"$(dirname \"$0\")/"
-                    + PACKAGE_NAME.encode("ascii")
-                    + b".bin\" \"$@\"\n"
-                )
-                os.chmod(launcher, 0o755)
-            elif not (stage / PACKAGE_NAME).is_file():
-                raise SystemExit(
-                    f"Nuitka Linux binary not found: {stage / PACKAGE_NAME}"
-                )
-        else:
-            native_bin = stage / f"{PACKAGE_NAME}.exe"
-            if not native_bin.is_file():
-                raise SystemExit(f"Nuitka Windows binary not found: {native_bin}")
+    bundle_dir = Path(args.bundle_dir).resolve()
+    if not bundle_dir.is_dir():
+        raise SystemExit(f"Nuitka bundle directory not found: {bundle_dir}")
+    shutil.copytree(bundle_dir, stage, dirs_exist_ok=True)
+    if args.platform == "linux":
+        native_bin = stage / f"{PACKAGE_NAME}.bin"
+        if native_bin.is_file():
+            launcher = stage / PACKAGE_NAME
+            launcher.write_bytes(
+                b"#!/bin/sh\nexec \"$(dirname \"$0\")/"
+                + PACKAGE_NAME.encode("ascii")
+                + b".bin\" \"$@\"\n"
+            )
+            os.chmod(launcher, 0o755)
+        elif not (stage / PACKAGE_NAME).is_file():
+            raise SystemExit(
+                f"Nuitka Linux binary not found: {stage / PACKAGE_NAME}"
+            )
     else:
-        if not args.binary:
-            raise SystemExit("--binary is required for PyInstaller packages")
-        binary = Path(args.binary).resolve()
-        if not binary.is_file():
-            raise SystemExit(f"binary not found: {binary}")
-        binary_name = PACKAGE_NAME + (".exe" if args.platform == "windows" else "")
-        copy_file(binary, stage / binary_name, 0o755 if args.platform == "linux" else 0o644)
+        native_bin = stage / f"{PACKAGE_NAME}.exe"
+        if not native_bin.is_file():
+            raise SystemExit(f"Nuitka Windows binary not found: {native_bin}")
     copy_file(ROOT / "LICENSE", stage / "LICENSE")
     copy_file(ROOT / "README.md", stage / "README.md")
     copy_file(
@@ -173,8 +160,7 @@ def main() -> int:
     copy_file(ROOT / "accounts" / "README.txt", stage / "data" / "accounts" / "README.txt")
     (stage / "data" / "usage" / ".gitkeep").write_bytes(b"")
 
-    engine_slug = "" if args.engine == "pyinstaller" else "-nuitka"
-    archive_name = f"{PACKAGE_NAME}-{version}{engine_slug}-{platform_slug}"
+    archive_name = f"{PACKAGE_NAME}-{version}-nuitka-{platform_slug}"
     if args.platform == "linux":
         archive = release_dir / f"{archive_name}.tar.gz"
         with tarfile.open(archive, "w:gz", format=tarfile.GNU_FORMAT, compresslevel=9) as tar:

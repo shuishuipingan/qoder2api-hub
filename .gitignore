@@ -28,7 +28,7 @@ python/
 .tmp_*
 _acc/
 
-# ---- PyInstaller / GitHub Actions packaged artifacts ----
+# ---- Nuitka / GitHub Actions packaged artifacts ----
 build/
 dist/
 release/
