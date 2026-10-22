@@ -2042,11 +2042,18 @@ def free_model_names(realm=None):
 def gateway_models_for_agents(realm=None):
     """面板「智能体配置」页的模型预填清单（与 /v1/models 同源裁剪）。"""
     try:
-        entries = fetch_models_merged(realm=realm) if realm else             fetch_models_merged()
+        entries = ([(mid, meta, realm) for mid, meta in fetch_models(realm=realm)]
+                   if realm else fetch_models_merged())
     except Exception:
         entries = []
     out = []
-    for e in entries if isinstance(entries, list) else []:
+    for row in entries if isinstance(entries, list) else []:
+        # fetch_models* 返回的是 (mid, meta, realm) 元组，不是 dict；
+        # 与 /v1/models 同样经 model_entry 展开成带 id / context_length 的字典。
+        try:
+            e = model_entry(row[0], row[1], realm=row[2])
+        except Exception:
+            continue
         if not isinstance(e, dict):
             continue
         mid = str(e.get("id") or "").strip()
