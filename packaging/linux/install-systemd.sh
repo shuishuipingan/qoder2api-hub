@@ -33,6 +33,15 @@ if ! id "$SYSTEM_USER" >/dev/null 2>&1; then
 fi
 
 install -d -m 0755 -o root -g root "$INSTALL_DIR"
+while IFS= read -r -d '' entry; do
+    base="$(basename "$entry")"
+    case "$base" in
+        data|START-HERE.md|LICENSE|*.sh)
+            continue
+            ;;
+    esac
+    cp -a "$entry" "$INSTALL_DIR/"
+done < <(find "$SCRIPT_DIR" -mindepth 1 -maxdepth 1 -print0)
 install -m 0755 "$SOURCE_BIN" "$INSTALL_DIR/$SERVICE_NAME"
 install -m 0755 "$SCRIPT_DIR/qoder2api-hub.sh" "$INSTALL_DIR/qoder2api-hub.sh"
 install -m 0644 "$SCRIPT_DIR/START-HERE.md" "$INSTALL_DIR/START-HERE.md" 2>/dev/null || true

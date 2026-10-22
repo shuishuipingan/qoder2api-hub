@@ -29,7 +29,15 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 New-Item -ItemType Directory -Force -Path $AccountsDir | Out-Null
 New-Item -ItemType Directory -Force -Path $UsageDir | Out-Null
-Copy-Item -LiteralPath $SourceBin -Destination $InstalledBin -Force
+Get-ChildItem -LiteralPath $SourceRoot -Force | Where-Object {
+    $_.Name -notin @("data", "START-HERE.md", "LICENSE") -and
+    $_.Extension -notin @(".bat", ".ps1")
+} | ForEach-Object {
+    Copy-Item -LiteralPath $_.FullName -Destination $InstallDir -Recurse -Force
+}
+if (-not (Test-Path -LiteralPath $InstalledBin)) {
+    throw "installed binary missing: $InstalledBin"
+}
 
 & icacls.exe $DataDir /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" | Out-Null
 
