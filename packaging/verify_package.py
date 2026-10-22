@@ -46,6 +46,8 @@ def verify_linux(archive: Path, engine: str) -> None:
         "qoder2api-hub/data/accounts/README.txt",
         "qoder2api-hub/data/usage/.gitkeep",
     }
+    if engine == "nuitka":
+        required.add("qoder2api-hub/umid/runtime-info")
     executable = {
         "qoder2api-hub/qoder2api-hub",
         "qoder2api-hub/qoder2api-hub.sh",
@@ -89,6 +91,11 @@ def verify_windows(archive: Path, engine: str) -> None:
         "qoder2api-hub/data/accounts/README.txt",
         "qoder2api-hub/data/usage/.gitkeep",
     }
+    if engine == "nuitka":
+        required.update({
+            "qoder2api-hub/umid/runtime-info.exe",
+            "qoder2api-hub/umid/sgsdk.dll",
+        })
     with zipfile.ZipFile(archive) as zf:
         names = set(zf.namelist())
         missing = sorted(required - names)

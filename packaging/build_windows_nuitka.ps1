@@ -42,8 +42,11 @@ $Arguments = @(
     "--include-data-file=qoder_agents.py=qoder_agents.py",
     "--include-data-file=LICENSE=LICENSE"
 )
-if (Test-Path -LiteralPath "umid") {
-    $Arguments += "--include-data-dir=umid=umid"
+if (Test-Path -LiteralPath "umid/runtime-info.exe") {
+    $Arguments += "--include-data-file=umid/runtime-info.exe=umid/runtime-info.exe"
+}
+if (Test-Path -LiteralPath "umid/sgsdk.dll") {
+    $Arguments += "--include-data-file=umid/sgsdk.dll=umid/sgsdk.dll"
 }
 $Arguments += "qoder_proxy.py"
 

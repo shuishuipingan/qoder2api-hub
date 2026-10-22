@@ -46,8 +46,8 @@ data_args=(
     --include-data-file=qoder_agents.py=qoder_agents.py
     --include-data-file=LICENSE=LICENSE
 )
-if [[ -d umid ]]; then
-    data_args+=(--include-data-dir=umid=umid)
+if [[ -f umid/runtime-info ]]; then
+    data_args+=(--include-data-file=umid/runtime-info=umid/runtime-info)
 fi
 
 "$VENV_DIR/bin/python" -m nuitka \
