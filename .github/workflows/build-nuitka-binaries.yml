@@ -86,7 +86,7 @@ jobs:
             --engine nuitka \
             --platform linux \
             --arch x86_64 \
-            --bundle-dir dist/nuitka-linux/qoder2api-hub.dist
+            --bundle-dir dist/nuitka-linux/qoder_proxy.dist
 
       - name: Verify GLIBC floor and smoke test
         run: |
@@ -140,7 +140,9 @@ jobs:
               (Test-Path "build-assets/umid-windows/runtime-info.exe") -and
               (Test-Path "build-assets/umid-windows/sgsdk.dll")) {
             New-Item -ItemType Directory -Force -Path "umid" | Out-Null
-            Copy-Item -Recurse -Force "build-assets/umid-windows/*" "umid/"
+            Copy-Item -LiteralPath "build-assets/umid-windows/runtime-info.exe" -Destination "umid/runtime-info.exe" -Force
+            Copy-Item -LiteralPath "build-assets/umid-windows/sgsdk.dll" -Destination "umid/sgsdk.dll" -Force
+            Get-ChildItem -LiteralPath "umid" | Select-Object Name, Length
           } else {
             Write-Host "::warning title=UMID skipped::Native UMID extraction failed; package will use derived identity fallback."
           }
@@ -157,7 +159,7 @@ jobs:
             --engine nuitka `
             --platform windows `
             --arch x64 `
-            --bundle-dir dist/nuitka-windows/qoder2api-hub.dist
+            --bundle-dir dist/nuitka-windows/qoder_proxy.dist
 
       - name: Smoke test Nuitka Windows binary
         shell: pwsh

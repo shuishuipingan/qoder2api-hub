@@ -15,6 +15,7 @@ $Arguments = @(
     "--assume-yes-for-downloads",
     "--remove-output",
     "--jobs=4",
+    "--lto=no",
     "--msvc=latest",
     "--windows-console-mode=force",
     "--output-dir=dist/nuitka-windows",

@@ -11,6 +11,10 @@ if [[ -n "$compiler_dir" ]]; then
 fi
 command -v gcc
 gcc --version | head -n1
+export CC="$(command -v gcc)"
+export CXX="$(command -v g++)"
+export LINK="$CC"
+export SHLINK="$CC"
 
 "$PYTHON_BIN" -m venv "$VENV_DIR"
 "$VENV_DIR/bin/pip" install --disable-pip-version-check "nuitka==$NUITKA_VERSION"
@@ -32,6 +36,7 @@ fi
     --assume-yes-for-downloads \
     --remove-output \
     --jobs=4 \
+    --lto=no \
     --output-dir=dist/nuitka-linux \
     --output-filename=qoder2api-hub \
     --include-module=qoder_accounts \
