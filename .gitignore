@@ -27,3 +27,9 @@ Thumbs.db
 python/
 .tmp_*
 _acc/
+
+# ---- PyInstaller / GitHub Actions packaged artifacts ----
+build/
+dist/
+release/
+build-assets/

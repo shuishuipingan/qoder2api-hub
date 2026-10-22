@@ -1,0 +1,169 @@
+name: Build binary packages
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - feat/pyinstaller-binary-packages
+    paths:
+      - ".github/workflows/build-binaries.yml"
+      - "packaging/**"
+      - "qoder2api-hub.spec"
+      - "qoder_*.py"
+      - "dashboard.html"
+      - "baseprompt.json"
+      - "qoder_catalog_*.json"
+      - "README.md"
+      - "LICENSE"
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: "1"
+  PYINSTALLER_VERSION: "6.22.3"
+
+jobs:
+  linux-x64:
+    name: Linux x86_64 (glibc 2.17+)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Extract UMID component (optional)
+        continue-on-error: true
+        run: |
+          set +e
+          python _install_umid.py --platform linux --arch x64 --dest build-assets/umid-linux
+          rc=$?
+          if [ "$rc" -eq 0 ] && [ -f build-assets/umid-linux/runtime-info ]; then
+            mkdir -p umid
+            cp -a build-assets/umid-linux/. umid/
+            file umid/runtime-info
+          else
+            echo "::warning title=UMID skipped::Native UMID extraction failed; package will use derived identity fallback."
+          fi
+          exit 0
+
+      - name: Build with PyInstaller in manylinux2014
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp \
+            -e PIP_DISABLE_PIP_VERSION_CHECK=1 \
+            -e PYINSTALLER_VERSION \
+            -v "$PWD:/src" \
+            -w /src \
+            quay.io/pypa/manylinux2014_x86_64:latest \
+            bash packaging/build_linux_manylinux.sh
+
+      - name: Assemble Linux package
+        run: |
+          python packaging/assemble.py \
+            --platform linux \
+            --arch x86_64 \
+            --binary dist/linux/qoder2api-hub
+
+      - name: Verify GLIBC floor and smoke test
+        run: |
+          set -euo pipefail
+          python packaging/verify_package.py --platform linux --arch x86_64
+          BIN="release/linux-x86_64/qoder2api-hub/qoder2api-hub"
+          file "$BIN"
+          MAX_GLIBC="$(objdump -T "$BIN" | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -n1)"
+          echo "max glibc symbol: ${MAX_GLIBC:-none}"
+          if [ -n "$MAX_GLIBC" ]; then
+            HIGHEST="$(printf '%s\n' "$MAX_GLIBC" GLIBC_2.17 | sort -Vu | tail -n1)"
+            test "$HIGHEST" = "GLIBC_2.17"
+          fi
+
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp \
+            -v "$PWD:/src" \
+            -w /src \
+            quay.io/pypa/manylinux2014_x86_64:latest \
+            bash packaging/smoke_linux.sh
+
+      - name: Upload Linux binary package
+        uses: actions/upload-artifact@v4
+        with:
+          name: qoder2api-hub-linux-x86_64
+          path: |
+            release/linux-x86_64/*.tar.gz
+            release/linux-x86_64/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+
+  windows-x64:
+    name: Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check "pyinstaller==$env:PYINSTALLER_VERSION"
+
+      - name: Extract UMID component (optional)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          python _install_umid.py --platform win32 --arch x64 --dest build-assets/umid-windows
+          if ($LASTEXITCODE -eq 0 -and
+              (Test-Path "build-assets/umid-windows/runtime-info.exe") -and
+              (Test-Path "build-assets/umid-windows/sgsdk.dll")) {
+            New-Item -ItemType Directory -Force -Path "umid" | Out-Null
+            Copy-Item -Recurse -Force "build-assets/umid-windows/*" "umid/"
+            Get-ChildItem "umid" | Select-Object Name, Length
+          } else {
+            Write-Host "::warning title=UMID skipped::Native UMID extraction failed; package will use derived identity fallback."
+          }
+
+      - name: Build with PyInstaller
+        shell: pwsh
+        run: |
+          python -m PyInstaller `
+            --noconfirm `
+            --clean `
+            --workpath build/pyinstaller-windows `
+            --distpath dist/windows `
+            qoder2api-hub.spec
+
+      - name: Assemble Windows package
+        shell: pwsh
+        run: |
+          python packaging/assemble.py `
+            --platform windows `
+            --arch x64 `
+            --binary dist/windows/qoder2api-hub.exe
+
+      - name: Smoke test Windows binary
+        shell: pwsh
+        run: |
+          python packaging/verify_package.py --platform windows --arch x64
+          .\packaging\smoke_windows.ps1 `
+            -Binary "release\windows-x64\qoder2api-hub\qoder2api-hub.exe"
+
+      - name: Upload Windows binary package
+        uses: actions/upload-artifact@v4
+        with:
+          name: qoder2api-hub-windows-x64
+          path: |
+            release/windows-x64/*.zip
+            release/windows-x64/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30

@@ -106,6 +106,9 @@ check("更新端点要求面板会话",
 check("更新端点默认只允许本机",
       "_update_allow_remote()" in _src and "_is_loopback(" in _src)
 check("支持 QD_UPDATE_DISABLE 禁用", "QD_UPDATE_DISABLE" in _src)
+check("PyInstaller 冻结程序禁用源码型自更新",
+      'FROZEN_BINARY = bool(getattr(sys, "frozen", False))' in _src
+      and "UPDATE_DISABLED = FROZEN_BINARY or" in _src)
 check("更新后自动重启（按原 argv）",
       "schedule_restart(_LAUNCH_ARGV" in _src and "_LAUNCH_ARGV = list(sys.argv)" in _src)
 check("GET /update/plan 预检存在", 'if path == "/update/plan":' in _src)
