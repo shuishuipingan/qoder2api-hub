@@ -46,8 +46,6 @@ def verify_linux(archive: Path, engine: str) -> None:
         "qoder2api-hub/data/accounts/README.txt",
         "qoder2api-hub/data/usage/.gitkeep",
     }
-    if engine == "nuitka":
-        required.add("qoder2api-hub/qoder2api-hub.bin")
     executable = {
         "qoder2api-hub/qoder2api-hub",
         "qoder2api-hub/qoder2api-hub.sh",
@@ -67,11 +65,14 @@ def verify_linux(archive: Path, engine: str) -> None:
         for name in executable:
             if not (members[name].mode & 0o111):
                 raise SystemExit(f"{name} is not executable: {members[name].mode:o}")
-        native_name = (
-            "qoder2api-hub/qoder2api-hub.bin"
+        native_names = (
+            ("qoder2api-hub/qoder2api-hub", "qoder2api-hub/qoder2api-hub.bin")
             if engine == "nuitka"
-            else "qoder2api-hub/qoder2api-hub"
+            else ("qoder2api-hub/qoder2api-hub",)
         )
+        native_name = next((name for name in native_names if name in members), "")
+        if not native_name:
+            raise SystemExit("Linux native binary is missing")
         minimum = 1024 * 1024 if engine == "nuitka" else 5 * 1024 * 1024
         if members[native_name].size < minimum:
             raise SystemExit(f"{native_name} is unexpectedly small")

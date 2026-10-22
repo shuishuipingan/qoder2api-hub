@@ -132,15 +132,18 @@ def main() -> int:
         shutil.copytree(bundle_dir, stage, dirs_exist_ok=True)
         if args.platform == "linux":
             native_bin = stage / f"{PACKAGE_NAME}.bin"
-            if not native_bin.is_file():
-                raise SystemExit(f"Nuitka Linux binary not found: {native_bin}")
-            launcher = stage / PACKAGE_NAME
-            launcher.write_bytes(
-                b"#!/bin/sh\nexec \"$(dirname \"$0\")/"
-                + PACKAGE_NAME.encode("ascii")
-                + b".bin\" \"$@\"\n"
-            )
-            os.chmod(launcher, 0o755)
+            if native_bin.is_file():
+                launcher = stage / PACKAGE_NAME
+                launcher.write_bytes(
+                    b"#!/bin/sh\nexec \"$(dirname \"$0\")/"
+                    + PACKAGE_NAME.encode("ascii")
+                    + b".bin\" \"$@\"\n"
+                )
+                os.chmod(launcher, 0o755)
+            elif not (stage / PACKAGE_NAME).is_file():
+                raise SystemExit(
+                    f"Nuitka Linux binary not found: {stage / PACKAGE_NAME}"
+                )
         else:
             native_bin = stage / f"{PACKAGE_NAME}.exe"
             if not native_bin.is_file():
