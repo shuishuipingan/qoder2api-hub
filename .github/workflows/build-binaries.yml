@@ -8,7 +8,14 @@ on:
       - feat/pyinstaller-binary-packages
     paths:
       - ".github/workflows/build-binaries.yml"
-      - "packaging/**"
+      - "packaging/assemble.py"
+      - "packaging/build_linux.sh"
+      - "packaging/smoke_linux.sh"
+      - "packaging/smoke_windows.ps1"
+      - "packaging/verify_package.py"
+      - "packaging/linux/**"
+      - "packaging/windows/**"
+      - "packaging/README-*.md"
       - "qoder2api-hub.spec"
       - "qoder_*.py"
       - "dashboard.html"

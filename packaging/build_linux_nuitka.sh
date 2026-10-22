@@ -19,6 +19,25 @@ export SHLINK="$CC"
 "$PYTHON_BIN" -m venv "$VENV_DIR"
 "$VENV_DIR/bin/pip" install --disable-pip-version-check "nuitka==$NUITKA_VERSION"
 
+# Nuitka 4.3.1 bundles SCons 4.10.1. Its POSIX fallback still names the
+# removed OS/2 "ilink" tool, so force the GNU linker tool when detection
+# cannot resolve gcc/g++ inside the manylinux container.
+"$VENV_DIR/bin/python" - <<'PY'
+from pathlib import Path
+import nuitka
+
+root = Path(nuitka.__file__).resolve().parent / "build" / "inline_copy" / "lib"
+for path in root.glob("scons-*/SCons/Tool/__init__.py"):
+    text = path.read_text(encoding="utf-8")
+    patched = text.replace(
+        "linkers = ['gnulink', 'ilink']",
+        "linkers = ['gnulink']",
+    )
+    if patched != text:
+        path.write_text(patched, encoding="utf-8")
+        print("patched SCons POSIX linker fallback:", path)
+PY
+
 data_args=(
     --include-data-file=baseprompt.json=baseprompt.json
     --include-data-file=dashboard.html=dashboard.html
