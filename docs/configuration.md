@@ -233,3 +233,15 @@ Redis 仅开放 Compose 内部网络，数据由专用命名卷保存。
 
 代价：每代跑一轮都会多消耗一次账号额度；默认关闭。
 
+
+### Chat 流式工具参数透传（可选）
+
+默认 `QD_CHAT_TOOL_ARGUMENTS=strict` 保留 #37 的 fail-closed 行为。
+对于能将参数解析/Schema 错误反馈给模型并继续工具循环的 Agent，可显式设置
+`QD_CHAT_TOOL_ARGUMENTS=passthrough` 后启动网关。仅作用于 Chat Completions 流式入口。
+
+回声外层数组必须合法，工具名必须全部在本次声明集合中；只放宽内层 `arguments`
+字符串的 JSON 校验，参数逐字保留，不修补、不删除调用、不自动重试。客户端必须
+在执行工具前验证参数，妥善处理非法 JSON 和缺失字段。这不是修复参数内容，也不能
+保证任意 Agent 都能继续。非流式、Anthropic、Responses 保持默认严格行为。
+网关仅记录透传事件，不输出参数正文；改回 `strict` 并重启即可回退。

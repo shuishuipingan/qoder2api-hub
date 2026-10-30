@@ -109,9 +109,13 @@ check("#47 端到端（回读路径）tool_calls 带非空 id",
 
 # ---- 7) 静态钉住：出口确实是包装器（防重构绕过）
 _src = open(os.path.join(ROOT, "qoder_proxy.py"), encoding="utf-8").read()
+import ast
+_wrapper = next(n for n in ast.parse(_src).body
+                if isinstance(n, ast.FunctionDef) and n.name == "recover_leaked_tool_calls")
+_calls = {n.func.id for n in ast.walk(_wrapper)
+          if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
 check("#47 recover_leaked_tool_calls 确实包了 _sse_fill_tool_call_ids",
-      "_sse_fill_tool_call_ids(" in _src
-      and "_sse_recover_dsml(" in _src
-      and "_recover_leaked_tool_calls_inner(frames, allowed_names)" in _src)
+      {"_sse_fill_tool_call_ids", "_sse_recover_dsml",
+       "_recover_leaked_tool_calls_inner"} <= _calls)
 
 finish()

@@ -4214,13 +4214,17 @@ def _salvage_echo_array(rest):
     return None
 
 
-def parse_leaked_tool_calls(text, allowed_names=None):
+def parse_leaked_tool_calls(text, allowed_names=None,
+                            allow_invalid_arguments=False):
     """把模型复述的「marker + JSON 数组」还原成结构化 tool_calls。
 
     严格守卫（避免把"讨论该标记的普通回复"误判为工具调用）：
       1) 整段正文 strip 后必须**恰好**是 marker + JSON 数组（可带 ``` 围栏）；
       2) 数组非空，每项 name 为非空字符串、arguments 为合法 JSON（字符串或对象）；
       3) 本次请求声明了 tools 时，所有 name 必须命中声明集合。
+
+    显式 allow_invalid_arguments 仅用于支持字符串参数错误反馈的 Chat 客户端；
+    必须有声明工具名集合，保留 arguments 原文，不猜测或修复内容。
 
     返回 (tool_calls|None, clean_text)：识别成功时 clean_text 为空串
     （整段都是该块）；未识别时原样返回 text。
@@ -4289,6 +4293,7 @@ def parse_leaked_tool_calls(text, allowed_names=None):
     if not isinstance(arr, list) or not arr:
         return None, text
     calls = []
+    invalid_arguments = False
     for item in arr:
         if not isinstance(item, dict):
             return None, text
@@ -4304,7 +4309,12 @@ def parse_leaked_tool_calls(text, allowed_names=None):
             try:
                 json.loads(args)
             except Exception:
-                return None, text
+                if not (allow_invalid_arguments and allowed_names
+                        and name.strip() in allowed_names):
+                    return None, text
+                # OpenAI tool arguments are a string. Preserve it byte-for-byte;
+                # parsing/execution belongs to the receiving agent in this mode.
+                invalid_arguments = True
         calls.append({
             "id": _new_id("call_"),
             "type": "function",
@@ -4313,6 +4323,9 @@ def parse_leaked_tool_calls(text, allowed_names=None):
     if allowed_names:
         if not all(c["function"]["name"] in allowed_names for c in calls):
             return None, text
+    if invalid_arguments:
+        log("forwarding unchanged invalid tool arguments to client (opt-in Chat mode)",
+            level="WARN", tag="chat")
     return calls, prefix
 
 
@@ -4750,7 +4763,8 @@ def _sse_fill_tool_call_ids(frames):
             yield raw
 
 
-def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
+def _recover_leaked_tool_calls_inner(frames, allowed_names=None,
+                                    allow_invalid_arguments=False):
     """流式回读（issue #8）：把模型逐块吐出的「marker + JSON 数组」正文恢复
     成结构化 tool_calls 增量帧；其余内容原样透传（fail-open）。
 
@@ -4843,6 +4857,21 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
             # 标签），但内容足以认定是**协议回声 + 内层参数非法**时，绝不能
             # 当正文补发——直接升级为协议错误（提前判定，不等流末）。
             if _echo_with_bad_args(hold, allowed_names):
+                if allow_invalid_arguments:
+                    calls, clean = parse_leaked_tool_calls(
+                        hold, allowed_names, allow_invalid_arguments=True)
+                    if calls:
+                        recovered = True
+                        for index, call in enumerate(calls):
+                            yield _leak_chunk_frame(
+                                meta, {"tool_calls": [dict(call, index=index)]})
+                        if clean:
+                            yield _leak_chunk_frame(meta, {"content": clean})
+                        hold = None
+                        hold_frames = 0
+                        if fin:
+                            finished = (_frame_without_content(payload), fin)
+                        continue
                 raise InvalidToolArguments()
             # issue #60 follow-up：散文 + marker 落在同一个大块时，hold 以散文开头
             # 会直接证伪——整块（含协议正文）被当正文补发。这里先把散文前缀放行，
@@ -4908,7 +4937,8 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
         yield raw
 
     if hold is not None:
-        calls, clean = parse_leaked_tool_calls(hold, allowed_names)
+        calls, clean = parse_leaked_tool_calls(
+            hold, allowed_names, allow_invalid_arguments=allow_invalid_arguments)
         if calls:
             recovered = True
             RECOVERY_STATS["leak"] = RECOVERY_STATS.get("leak", 0) + 1
@@ -5105,14 +5135,16 @@ def _sse_recover_dsml(frames, allowed_names=None):
         yield _leak_chunk_frame(meta, {}, "tool_calls")
 
 
-def recover_leaked_tool_calls(frames, allowed_names=None):
+def recover_leaked_tool_calls(frames, allowed_names=None,
+                              allow_invalid_arguments=False):
     """流式出口：回读（issue #8）+ **tool_call id 保证**（issue #47）。
 
     保持同名：三条调用点（chat 主链路 / Anthropic / Responses）都不用改。
     """
     for frame in _sse_fill_tool_call_ids(
             _sse_recover_dsml(
-                _recover_leaked_tool_calls_inner(frames, allowed_names),
+                _recover_leaked_tool_calls_inner(
+                    frames, allowed_names, allow_invalid_arguments),
                 allowed_names)):
         yield frame
 
@@ -11519,7 +11551,9 @@ class Handler(BaseHTTPRequestHandler):
                             for line in sse_with_heartbeat(
                                     recover_leaked_tool_calls(
                                         iter_inner_sse(cur, holder=holder),
-                                        allowed_names=_tool_names_from_payload(payload)),
+                                        allowed_names=_tool_names_from_payload(payload),
+                                        allow_invalid_arguments=(os.environ.get(
+                                            "QD_CHAT_TOOL_ARGUMENTS", "strict") == "passthrough")),
                                     self._sse_write):
                                 if first_ms is None:
                                     first_ms = int((time.time() - t_start) * 1000)
