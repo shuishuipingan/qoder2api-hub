@@ -256,7 +256,7 @@ VPC_DOMAIN_SUFFIX = "vpc.qoder.com.cn"
 
 
 def parse_vpc_endpoint(value):
-    """把 QD_CN_VPC_ENDPOINT 解析成企业 VPC 的三个官方主机。
+    """把实例名或实例域名解析成企业 VPC 的三个官方主机。
 
     接受实例名（acme）或三个按服务拆分的域名（acme.vpc.qoder.com.cn /
     acme-openapi.vpc.qoder.com.cn / acme-gateway.vpc.qoder.com.cn）。
@@ -307,30 +307,49 @@ def parse_vpc_endpoint(value):
     }
 
 
-_VPC_CN = None
-VPC_CONFIG_ERROR = ""
-try:
-    _VPC_CN = parse_vpc_endpoint(os.environ.get("QD_CN_VPC_ENDPOINT"))
-except ValueError as exc:
-    VPC_CONFIG_ERROR = str(exc)
+# 企业 VPC 一律按**账号**配置（账号文件里的 vpcEndpoint），不再读环境变量。
+#
+# 为什么可以直接停用 QD_CN_VPC_ENDPOINT：它只影响 REALM_CONFIGS 的初始
+# 域名字符串，而账号**落盘时 domain 已经写成实例域**（acme.vpc.qoder.com.cn）。
+# 新代码在 Account.__init__ 里从 domain 反推实例名（_vpc_instance_from_domain），
+# 所以老部署升级后行为不变，无需手工迁移。
+#
+# 仍然检测它是否被设置：静默忽略会让人以为还生效，明确告警才能让人知道
+# 该去面板改。VPC_ENV_DEPRECATED 由 qoder_proxy 在启动时读取并打印。
+VPC_ENV_DEPRECATED = bool(str(os.environ.get("QD_CN_VPC_ENDPOINT") or "").strip())
 
-_VPC_HOSTS = frozenset(
-    urllib.parse.urlsplit(_VPC_CN[key]).hostname.lower()
-    for key in ("website", "openapi", "gateway")
-    if _VPC_CN and urllib.parse.urlsplit(_VPC_CN[key]).hostname
-)
-
-
-def vpc_configured():
-    return _VPC_CN is not None
-
-
-def vpc_instance():
-    return (_VPC_CN or {}).get("instance", "")
+# 账号级 vpcEndpoint 解析出的三个主机（SSRF 白名单）。账号文件本来就是
+# 可信输入（里面就有 access token），从这里登记域名不放宽任何"请求里可
+# 注入"的面 —— validate_public_http_url 的通用规则保持不变。
+_VPC_HOSTS = set()
+_VPC_HOSTS_LOCK = threading.Lock()
 
 
-def vpc_config_error():
-    return VPC_CONFIG_ERROR
+def register_vpc_hosts(value):
+    """解析一个 VPC 实例名/域名，并把它的三个主机并入 SSRF 白名单。
+
+    返回 parse_vpc_endpoint 的结果；空值或非法值返回 None（调用方按
+    "没有 VPC 覆盖"处理，不抛异常——账号文件里的脏值不该让整池加载失败）。
+    """
+    try:
+        parsed = parse_vpc_endpoint(value)
+    except ValueError:
+        return None
+    if not parsed:
+        return None
+    hosts = []
+    for key in ("website", "openapi", "gateway"):
+        name = urllib.parse.urlsplit(str(parsed.get(key) or "")).hostname
+        if name:
+            hosts.append(name.lower())
+    if hosts:
+        with _VPC_HOSTS_LOCK:
+            _VPC_HOSTS.update(hosts)
+    return parsed
+
+
+def vpc_config_for(value):
+    return register_vpc_hosts(value)
 
 
 def vpc_endpoint_hosts():
@@ -338,7 +357,7 @@ def vpc_endpoint_hosts():
 
 
 def is_configured_vpc_host(host):
-    """仅对 QD_CN_VPC_ENDPOINT 推导出的三个主机放行解析级 SSRF 校验。
+    """仅对**账号已配置**的 VPC 实例三个主机放行解析级 SSRF 校验。
 
     企业 VPC 域名通常解析到公司内网地址，通用规则会把它当内网目标拒绝；
     但这是用户显式配置的固定主机，不是请求里可注入的 URL。
@@ -350,13 +369,14 @@ def is_configured_vpc_host(host):
 REALM_CONFIGS = {
     "cn": {
         "name": "国内版 (China)",
-        "openapi": (_VPC_CN or {}).get("openapi")
-                   or "https://openapi.qoder.com.cn",
-        "gateway": (_VPC_CN or {}).get("gateway")
-                   or "https://gateway.qoder.com.cn",
-        "website": (_VPC_CN or {}).get("website") or "https://qoder.com.cn",
-        "domain": (_VPC_CN or {}).get("domain") or "qoder.com.cn",
-        "vpc_instance": (_VPC_CN or {}).get("instance", ""),
+        # 公网默认值。企业 VPC 由**账号级** vpcEndpoint 覆盖（realm_config_for），
+        # 不再从这里读环境变量 —— 一个全局开关会让同机所有 CN 账号共用同一个
+        # 实例域，也不支持一个网关接多个实例。
+        "openapi": "https://openapi.qoder.com.cn",
+        "gateway": "https://gateway.qoder.com.cn",
+        "website": "https://qoder.com.cn",
+        "domain": "qoder.com.cn",
+        "vpc_instance": "",
         "client_id": "1c5e33e1-364d-4ce6-b02c-acaa81274a5c",
         "redirect_uri": "qoder-work-cn://",
         "ua": "QoderWork/1.1.75",
@@ -1304,12 +1324,56 @@ def get_realm_config(realm):
     return REALM_CONFIGS.get(realm) or REALM_CONFIGS["cn"]
 
 
-def gateway_candidates(realm):
+def _vpc_instance_from_domain(domain):
+    """acme.vpc.qoder.com.cn / acme-gateway.vpc.qoder.com.cn -> "acme"。
+
+    只认 VPC 后缀；公网域名、空值、非法形态一律返回 ""（表示没有 VPC）。
+    """
+    host = str(domain or "").strip().strip("[]").lower()
+    if not host.endswith("." + VPC_DOMAIN_SUFFIX):
+        return ""
+    instance = host[:-len("." + VPC_DOMAIN_SUFFIX)]
+    if instance.endswith("-openapi"):
+        instance = instance[:-len("-openapi")]
+    elif instance.endswith("-gateway"):
+        instance = instance[:-len("-gateway")]
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", instance):
+        return ""
+    return instance
+
+
+def realm_config_for(realm, vpc=None):
+    """按**账号级** vpcEndpoint 覆盖该区域的端点；没有则等价 get_realm_config。
+
+    VPC 是企业实例专属，只对国内版有意义：国际版传了也忽略，避免把
+    intl 账号指到一个 cn 域名上。
+    """
+    cfg = get_realm_config(realm)
+    if realm != "cn":
+        return cfg
+    parsed = vpc_config_for(vpc)
+    if not parsed:
+        return cfg
+    out = dict(cfg)
+    out.update({
+        "openapi": parsed["openapi"],
+        "gateway": parsed["gateway"],
+        "website": parsed["website"],
+        "domain": parsed["domain"],
+        "vpc_instance": parsed["instance"],
+        # 公网 api1/api2/api3 不能当企业实例的故障回退
+        "gateway_fallbacks": (),
+    })
+    return out
+
+
+def gateway_candidates(realm, cfg=None):
     """该区域的推理主机候选列表（官方客户端同款：主选 + 故障切换域名）。
 
     签名只覆盖 path，因此同一请求换主机后签名依旧有效。
+    ``cfg`` 传入账号自己的 realm 配置（可带 VPC 覆盖），不传则用区域默认。
     """
-    cfg = get_realm_config(realm)
+    cfg = cfg or get_realm_config(realm)
     out = [cfg["gateway"]]
     # 企业 VPC 只有实例专属推理域，公网 api1/api2/api3 不能作为故障回退。
     if cfg.get("vpc_instance"):
@@ -1320,14 +1384,14 @@ def gateway_candidates(realm):
     return out
 
 
-def cli_auth_dirs(realm):
+def cli_auth_dirs(realm, vpc=None):
     """官方 CLI 的凭据目录：公网 ``.auth`` +（VPC 模式）实例专属 ``.auth``。
 
     企业 VPC 账号可能由官方 CLI 登录在 ``~/.qoder-cn/.auth``，也可能按
     实例隔离在 ``~/.qoder-cn/.vpc/<instance>/.auth``；扫描两者，导入时
-    的 realm 仍是 cn。
+    的 realm 仍是 cn。``vpc`` 为账号级实例名（账号文件里的 vpcEndpoint）。
     """
-    cfg = get_realm_config(realm)
+    cfg = realm_config_for(realm, vpc)
     root = os.path.join(os.path.expanduser("~"), cfg["home_dir"])
     out = []
     instance = str(cfg.get("vpc_instance") or "")
@@ -1631,7 +1695,7 @@ def validate_public_http_url(url, allow_local=False):
     if not host:
         raise ValueError("URL host is required")
     # 企业 VPC 专属域通常解析到公司内网，不能按公网目标拒绝；只放行
-    # QD_CN_VPC_ENDPOINT 推导出的固定主机。
+    # 账号显式配置（vpcEndpoint）推导出的固定主机。
     if is_configured_vpc_host(host):
         return url
     if host == "localhost" or host.endswith(".localhost") or host.endswith(".local"):
@@ -1832,12 +1896,27 @@ class Account(object):
         # issue #69：账号备注（纯展示，不参与任何判定）
         self.note = str(data.get("note") or "")
         self.group = str(data.get("group") or "").strip()
+        # 账号级企业 VPC（仅国内版）：实例名（acme）或实例域名。空 = 走公网。
+        # 必须在 domain 默认值之前解析——domain 的兜底值取自 VPC 域名。
+        self.vpc_endpoint = str(data.get("vpcEndpoint") or "").strip()
         self.domain = str(data.get("domain") or "")
         self.realm = str(data.get("realm") or detect_realm_from_domain(self.domain))
         if self.realm not in REALM_CONFIGS:
             self.realm = "cn"
+        if self.realm != "cn" and self.vpc_endpoint:
+            # 国际版没有实例专属域：脏配置不该把账号带到 cn 域名上。
+            self.vpc_endpoint = ""
+        if not self.vpc_endpoint and self.realm == "cn":
+            # 老账号只有 domain（导入/VPC 客户端登录时就带着实例域），没有
+            # vpcEndpoint 字段。从 domain 反推实例名：否则这类账号的推理会
+            # 被发到**公网** gateway，而它的 token 只对实例域有效 —— 上游
+            # 的观感就是"Login expired"，查半天查不出原因。
+            self.vpc_endpoint = _vpc_instance_from_domain(self.domain)
+        # 无条件解析一次：顺带把该账号的 VPC 主机登记进 SSRF 白名单
+        # （realm_config_for -> vpc_config_for -> register_vpc_hosts）。
+        _cfg = self.realm_config()
         if not self.domain:
-            self.domain = get_realm_config(self.realm)["domain"]
+            self.domain = _cfg["domain"]
         self.platform = str(data.get("platform") or "CLI")
         self.access_token = str(data.get("accessToken") or "")
         self.refresh_token = str(data.get("refreshToken") or "")
@@ -1926,6 +2005,14 @@ class Account(object):
         self.machine_headers_state = MACHINE_HEADERS_OMITTED
 
     # -- 持久化 ------------------------------------------------------------
+    def realm_config(self):
+        """本账号实际使用的区域端点（含账号级 VPC 覆盖）。
+
+        账号内所有 openapi / gateway / website 的取值都必须走这里，别直接
+        调 get_realm_config(self.realm) —— 后者只认全局环境变量。
+        """
+        return realm_config_for(self.realm, getattr(self, "vpc_endpoint", ""))
+
     def to_dict(self):
         return {
             "uid": self.uid,
@@ -1933,6 +2020,7 @@ class Account(object):
             "group": self.group,
             "domain": self.domain,
             "realm": self.realm,
+            "vpcEndpoint": self.vpc_endpoint,
             "platform": self.platform,
             "accessToken": self.access_token,
             "refreshToken": self.refresh_token,
@@ -2015,6 +2103,7 @@ class Account(object):
             "group": self.group,
             "domain": self.domain,
             "realm": self.realm,
+            "vpcEndpoint": self.vpc_endpoint,
             "platform": self.platform,
             "enabled": bool(self.enabled),
             "source": self.source,
@@ -2469,7 +2558,7 @@ class Account(object):
 
     # -- 出站头 ------------------------------------------------------------
     def headers(self, purpose="openapi"):
-        cfg = get_realm_config(self.realm)
+        cfg = self.realm_config()
         return {
             "Content-Type": "application/json",
             "Accept": "application/json, text/plain, */*",
@@ -2577,7 +2666,7 @@ class Account(object):
 
         PAT 永不覆盖活跃的 OAuth 会话，只做 jrt- 过期后的最终兜底。
         """
-        cfg = get_realm_config(self.realm)
+        cfg = self.realm_config()
         base = cfg["openapi"]
         # 1) OAuth 设备族
         if self.refresh_token.startswith("drt-"):
@@ -2601,7 +2690,7 @@ class Account(object):
             "Content-Type": "application/json",
             "Accept": "application/json",
             # 与 headers() 同口径：token 刷新同样要发官方客户端 UA。
-            "User-Agent": get_realm_config(self.realm).get("ua") or CLIENT_UA,
+            "User-Agent": self.realm_config().get("ua") or CLIENT_UA,
         }
         try:
             data = http_json(url, data=json.dumps(payload).encode(), method="POST",
@@ -2958,7 +3047,7 @@ class Account(object):
                 and getattr(self, "machine_headers_state", "") == MACHINE_HEADERS_OMITTED \
                 and not _machine_minimal_disabled():
             try:
-                q2 = http_json(get_realm_config(self.realm)["openapi"] + PATH_CAMPAIGNS,
+                q2 = http_json(self.realm_config()["openapi"] + PATH_CAMPAIGNS,
                                method="GET",
                                headers=self.desktop_headers(minimal=True),
                                timeout=15, retries=1)
@@ -3059,7 +3148,7 @@ class Account(object):
 
     def campaign_reward(self, campaign_id):
         """GET …/campaigns/{id}/reward -> 该活动的发放状态（幂等，只读）。"""
-        cfg = get_realm_config(self.realm)
+        cfg = self.realm_config()
         url = cfg["openapi"] + (PATH_CAMPAIGN_REWARD % campaign_id)
         try:
             return http_json(url, method="GET", headers=self.desktop_headers(),
@@ -3077,7 +3166,7 @@ class Account(object):
             （实测：同机多号共享每轮一次的额度，第二个号会被 BLOCKED 且列表里
             隐藏该活动——官方文档写"每账号"，实际执行是"每人"）。
         """
-        cfg = get_realm_config(self.realm)
+        cfg = self.realm_config()
         url = cfg["openapi"] + (PATH_CAMPAIGN_CLAIM % campaign_id)
         try:
             headers = self.desktop_headers()
@@ -3395,7 +3484,7 @@ class Account(object):
         limit: 只探测前 N 个候选（None = 全部）。命中者写入
         accounts/credits-source.json，之后 fetch_credits 优先用它。
         """
-        cfg = get_realm_config(self.realm)
+        cfg = self.realm_config()
         hosts = []
         for h in (cfg.get("openapi"), cfg.get("website")):
             h = str(h or "").rstrip("/")
@@ -3547,7 +3636,7 @@ class Account(object):
             _hit = self._fetch_credits_via_source(_dir, _src)
             if _hit:
                 return _hit
-        cfg = get_realm_config(self.realm)
+        cfg = self.realm_config()
         url = cfg["openapi"] + PATH_QUOTA
         hint = ""
         try:
@@ -3776,7 +3865,7 @@ class Account(object):
 
     def fetch_plan(self):
         """GET /api/v2/user/plan -> 套餐名（Pro Trial 等）。"""
-        cfg = get_realm_config(self.realm)
+        cfg = self.realm_config()
         url = cfg["openapi"] + PATH_PLAN
         try:
             p = http_json(url, method="GET", headers=self.headers(), timeout=15,
@@ -3792,7 +3881,7 @@ class Account(object):
 
     # -- Pro 升级包（一次性 +1800） ---------------------------------------
     def pro_eligibility(self):
-        cfg = get_realm_config(self.realm)
+        cfg = self.realm_config()
         url = cfg["openapi"] + PATH_PRO_ELIGIBILITY
         try:
             m = http_json(url, method="GET", headers=self.headers(), timeout=15,
@@ -3807,7 +3896,7 @@ class Account(object):
             return False, str(exc)
 
     def pro_claim(self):
-        cfg = get_realm_config(self.realm)
+        cfg = self.realm_config()
         url = cfg["openapi"] + PATH_PRO_CLAIM
         try:
             m = http_json(url, data=b"{}", method="POST", headers=self.headers(),
@@ -4587,6 +4676,28 @@ class AccountPool(object):
         account.save(self.dir)
         return account.public()
 
+    def set_vpc(self, uid, value):
+        """修改账号的企业 VPC 实例名（空 = 回公网）。返回 public() 或 None。
+
+        非法实例名直接抛 ValueError：这是用户显式输入的一次性配置，
+        静默吞掉只会让账号指向一个错误的域名，比报错更难排查。
+        """
+        account = self.get(uid)
+        if account is None:
+            return None
+        raw = str(value or "").strip()
+        if raw and account.realm != "cn":
+            raise ValueError("VPC is only available for CN accounts")
+        if raw:
+            parsed = register_vpc_hosts(raw)
+            if not parsed:
+                raise ValueError("invalid VPC endpoint: %r" % raw)
+            raw = parsed["instance"]
+        account.vpc_endpoint = raw
+        account.domain = account.realm_config()["domain"]
+        account.save(self.dir)
+        return account.public()
+
     def set_all_enabled(self, enabled, realm=None):
         with self._lock:
             for account in self.accounts:
@@ -4661,9 +4772,9 @@ class AccountPool(object):
 
     # -- OAuth 设备授权登录 ------------------------------------------------
     @staticmethod
-    def _local_machine_id(realm):
+    def _local_machine_id(realm, vpc=None):
         """读取本机官方客户端的 machine_id（优先，保持设备一致），缺则生成。"""
-        for auth_dir in cli_auth_dirs(realm):
+        for auth_dir in cli_auth_dirs(realm, vpc):
             try:
                 with open(os.path.join(auth_dir, "machine_id"),
                           encoding="utf-8") as fh:
@@ -4674,7 +4785,7 @@ class AccountPool(object):
                 pass
         return str(uuid.uuid4())
 
-    def start_login(self, realm="cn", platform="CLI"):
+    def start_login(self, realm="cn", platform="CLI", vpc=None):
         """构造 PKCE 设备授权 URL（浏览器打开完成授权）。
 
         双区 URL 参数差异（官方逆向）：
@@ -4683,7 +4794,7 @@ class AccountPool(object):
           Intl : challenge, challenge_method, nonce(32-hex), client_id,
                  machine_id（新协议带 client_id/machine_id、不带 redirect_uri）
         """
-        cfg = get_realm_config(realm)
+        cfg = realm_config_for(realm, vpc)
         verifier, challenge = _make_pkce()
         nonce = uuid.uuid4().hex if not cfg["nonce_dashed"] else str(uuid.uuid4())
         q = {
@@ -4695,7 +4806,7 @@ class AccountPool(object):
             q["redirect_uri"] = cfg["redirect_uri"]
         if cfg.get("send_client_id"):
             q["client_id"] = cfg["client_id"]
-            q["machine_id"] = self._local_machine_id(realm)
+            q["machine_id"] = self._local_machine_id(realm, vpc)
         auth_url = cfg["website"] + "/device/selectAccounts?" + urllib.parse.urlencode(q)
         state = "qd-%d" % time.time_ns()
         with self._lock:
@@ -4705,6 +4816,9 @@ class AccountPool(object):
                 "nonce": nonce,
                 "region": realm,
                 "platform": platform,
+                # 账号级 VPC：poll 阶段必须用**同一个**实例的 openapi，
+                # 否则设备授权在 A 实例换 token 时被拿到 B 实例去兑。
+                "vpc": str(vpc or "").strip(),
             }
         return {"state": state, "authUrl": auth_url, "realm": realm,
                 "platform": platform}
@@ -4721,7 +4835,7 @@ class AccountPool(object):
                 self.logins.pop(state, None)
             return {"status": "expired", "message": "login window expired - start again"}
         realm = info.get("region") or "cn"
-        cfg = get_realm_config(realm)
+        cfg = realm_config_for(realm, info.get("vpc"))
         q = urllib.parse.urlencode({
             "nonce": info["nonce"],
             "verifier": info["verifier"],
@@ -4810,12 +4924,12 @@ class AccountPool(object):
             return self.logins.pop(state, None) is not None
 
     # -- PAT 导入 ----------------------------------------------------------
-    def import_pat(self, pat, realm="cn"):
+    def import_pat(self, pat, realm="cn", vpc=None):
         """导入 pt- 个人访问令牌：交换 jobToken 并拉取身份后入库。"""
         pat = str(pat or "").strip()
         if not pat.startswith("pt-"):
             raise ValueError("PAT must start with pt-")
-        cfg = get_realm_config(realm)
+        cfg = realm_config_for(realm, vpc)
         data = http_json(cfg["openapi"] + PATH_JOB_EXCHANGE,
                          data=json.dumps({"personal_token": pat}).encode(),
                          method="POST",
@@ -4849,6 +4963,7 @@ class AccountPool(object):
             "nickname": nickname or ("u" + (uid[-8:] if uid else uid[:8])),
             "domain": cfg["domain"],
             "realm": realm,
+            "vpcEndpoint": str(vpc or "").strip(),
             "platform": "CLI",
             "accessToken": token,
             "refreshToken": data.get("refresh_token") or "",

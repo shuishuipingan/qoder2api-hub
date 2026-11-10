@@ -158,7 +158,7 @@ def validate_public_http_url(url, allow_local=False):
     host = (parsed.hostname or "").strip().strip("[]").lower()
     if not host:
         raise ValueError("URL host is required")
-    # 企业 VPC 专属域通常解析到公司内网；只放行 QD_CN_VPC_ENDPOINT
+    # 企业 VPC 专属域通常解析到公司内网；只放行**账号已配置**的
     # 推导出的固定主机，普通公网 URL 的校验逻辑保持不变。
     if qoder_accounts.is_configured_vpc_host(host):
         return url
@@ -3153,7 +3153,8 @@ def read_dynamic_models(realm=None):
     # 签名以 qoder_encode("{}") 作为 body 参与 MD5；请求同样携带该 body。
     sign_body = qoder_encode(b"{}")
     payload = None
-    for host in gateway_candidates(r):
+    # 用**选中账号**的 realm 配置：VPC 账号只能从实例域拉清单，公网域会 403。
+    for host in gateway_candidates(r, account.realm_config()):
         raw_url = host + MODELS_PATH
         try:
             sess = SESSIONS.get(account)
@@ -8908,7 +8909,7 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
             raise PayloadTooLarge(len(encoded), MAX_UPSTREAM_BODY_BYTES)
         # 官方候选推理主机（国际版 api1/api2/api3）：传输层失败时切换域名，
         # 签名只覆盖 path，换主机不影响签名有效性。
-        hosts = gateway_candidates(account.realm)
+        hosts = gateway_candidates(account.realm, account.realm_config())
         host_i = 0
         raw_url = hosts[host_i] + CHAT_PATH
 
@@ -12836,9 +12837,13 @@ class Handler(BaseHTTPRequestHandler):
             target_realm = payload.get("realm") or CURRENT_REALM
             if target_realm not in ("intl", "cn"):
                 target_realm = "cn"
+            vpc = str(payload.get("vpc") or "").strip()
+            if vpc and target_realm != "cn":
+                return self._error(400, "VPC is only available for CN accounts",
+                                   "invalid_request_error")
             try:
                 started = POOL.start_login(realm=target_realm,
-                                           platform=platform)
+                                           platform=platform, vpc=vpc)
             except Exception as exc:
                 return self._error(502, "could not start login: %s" % exc)
             log("oauth device login started (realm=%s, state=%s)"
@@ -12853,7 +12858,9 @@ class Handler(BaseHTTPRequestHandler):
             if realm not in ("intl", "cn"):
                 realm = "cn"
             try:
-                account = POOL.import_pat(pat, realm=realm)
+                account = POOL.import_pat(
+                    pat, realm=realm,
+                    vpc=str(payload.get("vpc") or "").strip())
             except Exception as exc:
                 return self._error(400, "PAT import failed: %s" % exc)
             log("imported PAT account %s (realm=%s)"
@@ -13015,6 +13022,15 @@ class Handler(BaseHTTPRequestHandler):
             uid = payload.get("uid")
             if not uid:
                 return self._error(400, "uid required")
+            if "vpcEndpoint" in payload:
+                try:
+                    changed = POOL.set_vpc(uid, payload.get("vpcEndpoint"))
+                except ValueError as exc:
+                    return self._error(400, str(exc), "invalid_request_error")
+                if changed is None:
+                    return self._error(404, "no such account")
+                log("account %s vpc=%r" % (uid[:8], changed.get("vpcEndpoint") or ""))
+                return self._json(200, {"account": changed})
             updated = POOL.set_enabled(uid, bool(payload.get("enabled")))
             if updated is None:
                 return self._error(404, "no such account")
@@ -14424,14 +14440,16 @@ def main():
                     help="write the server PID to this file (stop.bat uses it; "
                          "removed on exit)")
     args = ap.parse_args()
-    if qoder_accounts.vpc_config_error():
+    if qoder_accounts.VPC_ENV_DEPRECATED:
+        # 不再读这个变量。账号落盘时 domain 已是实例域，升级后行为不变；
+        # 但静默忽略会让人以为它还生效，所以明确说一次。
         sys.stderr.write(
-            "[ERROR] invalid QD_CN_VPC_ENDPOINT: %s\n"
-            "        expected an instance name (e.g. acme) or one of\n"
-            "        acme.vpc.qoder.com.cn / acme-openapi.vpc.qoder.com.cn /\n"
-            "        acme-gateway.vpc.qoder.com.cn\n"
-            % qoder_accounts.vpc_config_error())
-        raise SystemExit(1)
+            "[WARN] QD_CN_VPC_ENDPOINT is no longer supported: enterprise VPC "
+            "is configured per account now.\n"
+            "       Open the panel -> Accounts -> VPC button (or set "
+            "vpcEndpoint in the account JSON).\n"
+            "       Existing accounts keep working: their domain already "
+            "records the instance.\n")
     qoder_logpaths.install_stream_logging(os.path.dirname(os.path.abspath(__file__)))
     if not args.usage_dir and not os.environ.get("QD_PROXY_USAGE_DIR"):
         _migration = qoder_logpaths.migrate_legacy_usage(
@@ -14645,15 +14663,14 @@ def main():
     log("realm      : %s (%s)" % (
         CURRENT_REALM,
         get_realm_config(CURRENT_REALM).get("domain") or "qoder.com.cn"))
-    if qoder_accounts.vpc_configured():
-        _cn = qoder_accounts.get_realm_config("cn")
-        log("vpc        : %s (openapi=%s gateway=%s)"
-            % (qoder_accounts.vpc_instance(), _cn["openapi"], _cn["gateway"]),
-            tag="realm")
-        if CURRENT_REALM != "cn":
-            log("VPC endpoint is CN-only, but the current realm is %s - "
-                "switch to CN in the dashboard or set QD_PROXY_DEFAULT_REALM=cn"
-                % CURRENT_REALM, level="WARN", tag="realm")
+    _vpc_accounts = [a for a in (POOL.accounts if POOL else [])
+                     if getattr(a, "vpc_endpoint", "")]
+    if _vpc_accounts:
+        log("vpc        : %d account(s) on enterprise instances: %s"
+            % (len(_vpc_accounts),
+               ", ".join("%s=%s" % ((a.uid or "?")[:8], a.vpc_endpoint)
+                         for a in _vpc_accounts[:5])
+               + (" ..." if len(_vpc_accounts) > 5 else "")), tag="realm")
     log("catalog    : %s" % (BASEPROMPT_PATH if BASEPROMPT
                              else "baseprompt.json MISSING"))
 

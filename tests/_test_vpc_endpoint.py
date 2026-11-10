@@ -1,18 +1,17 @@
-"""QD_CN_VPC_ENDPOINT 企业 VPC 专属域套件。
+"""企业 VPC 的**账号级**模型套件（替代原 QD_CN_VPC_ENDPOINT 全局套件）。
 
 判据：
-  1. 解析只接受实例名或 vpc.qoder.com.cn 下的三种官方域名，拒绝路径 /
-     端口 / 凭据 / query / fragment，防止只改掉流程里的一部分端点；
-  2. 配置后 CN 的 openapi / gateway / website 全部切换到专属域，且
-     openapi / gateway 候选**不允许**回退到公网；
-  3. 专属域解析到内网地址时，两处 SSRF 校验只放行这三个推导主机；
-     未配置的 vpc.qoder.com.cn 域名仍按公网规则拒绝；
-  4. 未设置环境变量时，现有 CN 行为逐字节不变。
+  1. QD_CN_VPC_ENDPOINT 不再生效：设了也只留一条 WARN，区域端点保持公网；
+  2. 解析规则保持不变（实例名 / 三种官方域名；拒绝路径、端口、凭据、query）；
+  3. 实例名能从账号 domain 反推（老账号升级路径）；
+  4. SSRF 白名单只登记**账号显式配置**的实例，未登记的 vpc 域名照旧按
+     公网规则校验（解析到内网 -> 拒绝）。
 
     python tests/_test_vpc_endpoint.py
 """
 import json
 import os
+import socket
 import subprocess
 import sys
 
@@ -21,7 +20,6 @@ sys.path.insert(0, HERE)
 from _suite_head import ROOT, bootstrap, check, declare_suite, finish  # noqa: E402
 
 os.environ.pop("QD_CN_VPC_ENDPOINT", None)
-os.environ.pop("QD_CN_OPENAPI", None)
 P, A = bootstrap()
 declare_suite(__file__, ["qoder_accounts.py", "qoder_proxy.py"])
 
@@ -66,14 +64,14 @@ for value in BAD:
         ok = True
     check("拒绝 %r" % value, ok)
 
-print("\n[vpc] 3) 未配置：现有 CN 行为不变")
-check("CN openapi 仍是公网",
+print("\n[vpc] 3) 未配置账号：CN 行为就是公网")
+check("CN openapi 是公网",
       A.get_realm_config("cn")["openapi"] == "https://openapi.qoder.com.cn")
-check("CN gateway 仍是单一官方主机",
+check("CN gateway 是单一官方主机",
       A.gateway_candidates("cn") == ["https://gateway.qoder.com.cn"])
 check("CN openapi 候选不含 VPC 域",
       not any("vpc.qoder.com.cn" in c for c in A.openapi_candidates("cn")))
-check("未配置时 is_configured_vpc_host 为 False",
+check("未登记时 is_configured_vpc_host 为 False",
       not A.is_configured_vpc_host("acme-openapi.vpc.qoder.com.cn"))
 
 
@@ -89,95 +87,88 @@ def run_py(code, env_extra):
     return out.strip().splitlines()[-1]
 
 
-print("\n[vpc] 4) 子进程：QD_CN_VPC_ENDPOINT=acme 的模块状态")
+print("\n[vpc] 4) 子进程：QD_CN_VPC_ENDPOINT 已失效（只告警，不改端点）")
 CODE = r'''
 import json
 import qoder_accounts as A
 cn = A.get_realm_config("cn")
 print(json.dumps({
-    "error": A.vpc_config_error(),
-    "instance": A.vpc_instance(),
-    "openapi": cn["openapi"],
-    "gateway": cn["gateway"],
-    "website": cn["website"],
-    "domain": cn["domain"],
-    "openapi_candidates": A.openapi_candidates("cn"),
+    "deprecated": A.VPC_ENV_DEPRECATED,
+    "openapi": cn["openapi"], "gateway": cn["gateway"],
+    "website": cn["website"], "domain": cn["domain"],
     "gateway_candidates": A.gateway_candidates("cn"),
-    "hosts": sorted(A.vpc_endpoint_hosts()),
 }, ensure_ascii=False))
 '''
 data = json.loads(run_py(CODE, {"QD_CN_VPC_ENDPOINT": "acme"}))
-check("配置读取无错误", data["error"] == "", data["error"])
-check("实例名 = acme", data["instance"] == "acme", data["instance"])
-check("openapi = 专属域",
-      data["openapi"] == "https://acme-openapi.vpc.qoder.com.cn", data["openapi"])
-check("gateway = 专属域",
-      data["gateway"] == "https://acme-gateway.vpc.qoder.com.cn", data["gateway"])
-check("website = 专属域",
-      data["website"] == "https://acme.vpc.qoder.com.cn", data["website"])
-check("domain = 专属域",
-      data["domain"] == "acme.vpc.qoder.com.cn", data["domain"])
-check("openapi 候选只有专属域（不回退公网）",
-      data["openapi_candidates"] == ["https://acme-openapi.vpc.qoder.com.cn"],
-      data["openapi_candidates"])
-check("gateway 候选只有专属域（不回退 api1/2/3）",
-      data["gateway_candidates"] == ["https://acme-gateway.vpc.qoder.com.cn"],
+check("检测到旧变量仍被设置", data["deprecated"] is True, data["deprecated"])
+check("openapi 仍是公网（变量不再生效）",
+      data["openapi"] == "https://openapi.qoder.com.cn", data["openapi"])
+check("gateway 仍是公网",
+      data["gateway"] == "https://gateway.qoder.com.cn", data["gateway"])
+check("website 仍是公网", data["website"] == "https://qoder.com.cn",
+      data["website"])
+check("domain 仍是公网", data["domain"] == "qoder.com.cn", data["domain"])
+check("候选不含实例域",
+      data["gateway_candidates"] == ["https://gateway.qoder.com.cn"],
       data["gateway_candidates"])
-check("放行主机集合 = 三个专属域", data["hosts"] == [
-    "acme-gateway.vpc.qoder.com.cn",
-    "acme-openapi.vpc.qoder.com.cn",
-    "acme.vpc.qoder.com.cn",
-], data["hosts"])
 
-print("\n[vpc] 5) 子进程：非法值会留下启动错误")
-err = run_py("import qoder_accounts as A; print(A.vpc_config_error())",
-             {"QD_CN_VPC_ENDPOINT": "bad host"})
-check("非法值产生非空错误", bool(err) and "invalid VPC endpoint" in err, err)
+plain = json.loads(run_py(CODE, {"QD_CN_VPC_ENDPOINT": ""}))
+check("未设置变量时没有告警", plain["deprecated"] is False, plain["deprecated"])
 
-print("\n[vpc] 6) 子进程：内网解析时只放行配置的专属域")
-CODE_SSRF = r'''
-import json
-import socket
+bad_env = json.loads(run_py(CODE, {"QD_CN_VPC_ENDPOINT": "bad host"}))
+check("非法旧值也不会让进程起不来", bad_env["deprecated"] is True,
+      bad_env["deprecated"])
+check("非法旧值同样不改端点",
+      bad_env["gateway"] == "https://gateway.qoder.com.cn", bad_env["gateway"])
 
-_orig = socket.getaddrinfo
+print("\n[vpc] 5) 从账号 domain 反推实例")
+DERIVE = {
+    "acme.vpc.qoder.com.cn": "acme",
+    "acme-gateway.vpc.qoder.com.cn": "acme",
+    "acme-openapi.vpc.qoder.com.cn": "acme",
+    "ACME.VPC.QODER.COM.CN": "acme",
+    "qoder.com.cn": "",
+    "": "",
+    "-acme.vpc.qoder.com.cn": "",
+    "acme.vpc.qoder.com.cn.evil.test": "",
+}
+for domain, want in DERIVE.items():
+    got = A._vpc_instance_from_domain(domain)
+    check("domain %r -> %r" % (domain, want), got == want, got)
+
+print("\n[vpc] 6) SSRF：只有账号登记的实例被放行")
+parsed = A.register_vpc_hosts("acme")
+check("登记成功", (parsed or {}).get("instance") == "acme", parsed)
+check("三个专属域被放行",
+      all(A.is_configured_vpc_host(h) for h in (
+          "acme.vpc.qoder.com.cn", "acme-openapi.vpc.qoder.com.cn",
+          "acme-gateway.vpc.qoder.com.cn")))
+check("别的实例没有被连带放行",
+      not A.is_configured_vpc_host("other-openapi.vpc.qoder.com.cn"))
+
+_real_gai = socket.getaddrinfo
 
 
-def fake(host, port, *args, **kwargs):
-    if str(host).lower().endswith(".vpc.qoder.com.cn"):
-        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "",
-                 ("10.20.30.40", port or 443))]
-    return _orig(host, port, *args, **kwargs)
+def _fake_gai(host, port, *a, **k):
+    if str(host).endswith("vpc.qoder.com.cn"):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.9.8.7", port))]
+    return _real_gai(host, port, *a, **k)
 
 
-socket.getaddrinfo = fake
-import qoder_accounts as A
-import qoder_proxy as P
-
-res = {}
-for name, fn in (("accounts", A.validate_public_http_url),
-                 ("proxy", P.validate_public_http_url)):
-    def probe(url):
-        try:
-            fn(url)
-            return "ok"
-        except Exception as exc:
-            return "blocked:%s" % exc
-    res[name + "_vpc"] = probe(
-        "https://acme-openapi.vpc.qoder.com.cn/api/v1/userinfo")
-    res[name + "_other"] = probe("https://other.vpc.qoder.com.cn/api/v1/userinfo")
-print(json.dumps(res, ensure_ascii=False))
-'''
-ssrf = json.loads(run_py(CODE_SSRF, {"QD_CN_VPC_ENDPOINT": "acme"}))
-check("qoder_accounts 放行配置的专属域（即使解析到内网）",
-      ssrf.get("accounts_vpc") == "ok", ssrf.get("accounts_vpc"))
-check("qoder_proxy 放行配置的专属域（即使解析到内网）",
-      ssrf.get("proxy_vpc") == "ok", ssrf.get("proxy_vpc"))
-check("未配置的 vpc.qoder.com.cn 仍按内网目标拒绝",
-      str(ssrf.get("accounts_other", "")).startswith("blocked:"),
-      ssrf.get("accounts_other"))
-check("qoder_proxy 同样拒绝未配置的同后缀域名",
-      str(ssrf.get("proxy_other", "")).startswith("blocked:"),
-      ssrf.get("proxy_other"))
+socket.getaddrinfo = _fake_gai
+try:
+    check("已登记实例解析到内网仍然放行",
+          A.validate_public_http_url(
+              "https://acme-openapi.vpc.qoder.com.cn/api/v1/x").startswith(
+                  "https://acme-openapi"))
+    try:
+        A.validate_public_http_url("https://evil-openapi.vpc.qoder.com.cn/x")
+        blocked = False
+    except ValueError:
+        blocked = True
+    check("未登记的 vpc 域名解析到内网 -> 拒绝", blocked)
+finally:
+    socket.getaddrinfo = _real_gai
 
 print("\n[vpc] 7) 审查补充：冲突配置与 DNS label 边界")
 for value in ("a" * 56, "a" * 63, "acme:", "acme?", "acme.vpc.qoder.com.cn:"):
