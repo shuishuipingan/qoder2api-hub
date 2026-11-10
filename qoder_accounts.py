@@ -3462,7 +3462,7 @@ class Account(object):
         打另一区的 quota 会成功。只在 403 时探测一次，不发任何写操作。
         返回可读提示字符串；不属于该情形返回空串。
         """
-        if vpc_configured():
+        if self.realm_config().get("vpc_instance"):
             return ""  # VPC 与公网令牌不得通过跨区域诊断互相试探。
         other = "cn" if self.realm != "cn" else "intl"
         try:
@@ -3610,7 +3610,7 @@ class Account(object):
         path = str(src.get("path") or "")
         if not host or not path:
             return None
-        cfg = get_realm_config(self.realm)
+        cfg = self.realm_config()
         if cfg.get("vpc_instance") and host not in (cfg["openapi"], cfg["website"]):
             return None  # 忽略公网或其它实例遗留的额度来源缓存。
         try:
