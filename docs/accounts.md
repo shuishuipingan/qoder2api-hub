@@ -133,14 +133,17 @@
 
 ### 企业 VPC 专属域（CN）
 
-如果企业购买的是 Qoder CN（全家桶）企业 VPC 版，服务入口不是公网 `gateway.qoder.com.cn`，而是实例专属域。启动网关前设置：
+如果企业购买的是 Qoder CN（全家桶）企业 VPC 版，服务入口不是公网 `gateway.qoder.com.cn`，而是实例专属域。
 
-```bash
-export QD_CN_VPC_ENDPOINT=acme       # 也可以填 acme.vpc.qoder.com.cn
-./start-qoder-proxy.sh
-```
+**VPC 配置在账号上，不在网关进程上**：同一个网关可以同时接公网账号和多个不同实例的企业账号，互不干扰。
 
-网关按官方 CLI 的固定映射推导三个端点：
+有三种设置方式：
+
+1. **添加账号时填**：面板「添加 Qoder 账号」弹窗里，选中「国内版」后会出现「企业 VPC（可选）」输入框
+2. **给已有账号改**：账号列表每行的 **VPC** 按钮（仅国内版可见），留空即回公网
+3. **接口 / 文件**：`POST /accounts/set {"uid": "...", "vpcEndpoint": "acme"}`，或直接改账号 JSON 的 `vpcEndpoint`
+
+值可以填实例名（`acme`）或实例域名（`acme.vpc.qoder.com.cn` / `acme-gateway.vpc.qoder.com.cn`）。网关按官方 CLI 的固定映射推导三个端点：
 
 | 用途 | 地址 |
 |---|---|
@@ -148,12 +151,15 @@ export QD_CN_VPC_ENDPOINT=acme       # 也可以填 acme.vpc.qoder.com.cn
 | OpenAPI | `https://acme-openapi.vpc.qoder.com.cn` |
 | 推理网关 | `https://acme-gateway.vpc.qoder.com.cn` |
 
-- 只对国内版生效；国际版账号仍走公网 `api3.qoder.sh`
-- VPC 模式**不会回退**到公网 openapi / gateway；优先于旧的 `QD_CN_OPENAPI` 覆盖，忽略公网 / 其它实例的额度来源缓存，并关闭跨区域令牌诊断，避免把企业凭证发到错误入口
+- 只对国内版生效；国际版账号填了也会被忽略（接口直接返回 400），仍走公网 `api3.qoder.sh`
+- VPC 账号**不会回退**到公网 openapi / gateway；优先于旧的 `QD_CN_OPENAPI` 覆盖，忽略公网 / 其它实例的额度来源缓存，并关闭跨区域令牌诊断，避免把企业凭证发到错误入口
 - 实例名最长 55 字符，保证追加 `-gateway` 后的 DNS 标签不超过 63 字符；仅允许重定向到本实例的 HTTPS 默认端口
-- 网关所在机器必须能访问企业 VPC（专线、VPN 或内网 DNS）。专属域解析到内网地址是预期行为，SSRF 防护只放行这三个推导出来的主机
-- 「添加账号（OAuth）」「导入 PAT」会走 VPC 的 OpenAPI；「扫描本机凭证」会同时检查 `~/.qoder-cn/.auth` 和 `~/.qoder-cn/.vpc/<实例名>/.auth`
-- 启动日志会打印 `vpc : acme (openapi=... gateway=...)`；如果当前出口仍是国际版，会额外打印 WARN
+- 网关所在机器必须能访问企业 VPC（专线、VPN 或内网 DNS）。专属域解析到内网地址是预期行为，SSRF 防护只对**该账号已配置**的这三个主机放行，其他 `vpc.qoder.com.cn` 域名照旧按公网规则拒绝
+- 「添加账号（OAuth）」「导入 PAT」会走该实例的 OpenAPI；设备授权的发码与兑换固定在**同一个实例**上
+- 「扫描本机凭证」会同时检查 `~/.qoder-cn/.auth` 和 `~/.qoder-cn/.vpc/<实例名>/.auth`
+- 账号列表的「版本」列会显示 **VPC** 徽标；启动日志会打印每个实例上有几个账号
+
+> **从旧版本升级**：`QD_CN_VPC_ENDPOINT` 不再读取（设置了只打印一条 WARN）。不需要手工迁移——账号落盘时 `domain` 已经写成 `acme.vpc.qoder.com.cn`，网关会从 `domain` 反推实例名。
 
 ### 「企业号抓不到」的常见原因
 
