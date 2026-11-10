@@ -1290,14 +1290,17 @@ def _machine_minimal_disabled():
     return raw in ("0", "off", "false", "no", "disable", "disabled")
 
 
-def openapi_candidates(realm):
+def openapi_candidates(realm, cfg=None):
     """该区域 openapi 基址候选（issue: 国际版签不到到）。
 
     官方把业务端点都挂在 openapi 基址上；国际版历史上是 openapi.qoder.sh，
     但该域名在部分网络/时期不可达，表现为「活动列表拿不到 -> 签到无效」。
     这里给出候选顺序，调用方**只在连接失败或 404 时**换下一个，业务错误不重试。
+
+    ``cfg`` 传账号自己的 realm 配置（`Account.realm_config()`）：账号级 VPC
+    必须只走实例域，不能因为区域默认值把企业凭证发到公网。
     """
-    cfg = get_realm_config(realm)
+    cfg = cfg or get_realm_config(realm)
     r = str(realm or "cn")
     # 专属实例配置优先于遗留的 OPENAPI 覆盖；不得将企业凭据先送往公网。
     if cfg.get("vpc_instance"):
@@ -2973,7 +2976,7 @@ class Account(object):
         if openapi_missing(self.realm, path):
             return None, 404, "cached 404 (known missing in %s)" % self.realm
         tried = 0
-        _bases = openapi_candidates(self.realm)
+        _bases = openapi_candidates(self.realm, self.realm_config())
         if not fallback:
             _bases = _bases[:1]
         for base in _bases:
