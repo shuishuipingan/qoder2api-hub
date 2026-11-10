@@ -21,9 +21,9 @@ def _page(name):
 
 print("[accounts] 导航与页签")
 check("导航栏有「账号」入口", 'id="btnNavAccounts"' in _dash)
-check("入口带人物图标",
+check("入口是文字标签「账号」（导航统一为文字，不再单独挂图标）",
       'id="btnNavAccounts"' in _dash
-      and _dash.split('id="btnNavAccounts"')[1][:400].count("<svg") == 1)
+      and ">账号<" in _dash.split('id="btnNavAccounts"')[1][:200])
 check("MAIN_TABS 含 accounts",
       "'accounts'" in _dash.split("const MAIN_TABS =")[1][:200])
 check("预点亮 TABS 也含 accounts（否则刷新会回落网关页）",

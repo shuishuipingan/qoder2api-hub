@@ -116,7 +116,7 @@ check("面板有「一键更新」按钮", "applyUpdate(this)" in _dash and "一
 check("面板调用 /update/apply", "'/update/apply'" in _dash)
 check("更新后轮询 /health 并自动刷新",
       "waitForRestart" in _dash and "location.reload()" in _dash)
-check("更新前有确认提示", "confirm(" in _dash.split("function applyUpdate")[1][:400])
+check("更新前有确认提示", "uiConfirm(" in _dash.split("function applyUpdate")[1][:400])
 check("schedule_restart 无 argv 时返回 False", U.schedule_restart([]) is False)
 
 finish()

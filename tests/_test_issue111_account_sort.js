@@ -20,7 +20,7 @@ function slice(from, to){
 }
 
 const SORT = slice('// ---- 账号表排序（issue #111）', 'function renderAccounts(){');
-const THEAD_HEAD = 'box.innerHTML = ';
+const THEAD_HEAD = 'uiSetHTML(box, ';
 // 结束锚点必须指向**账号表**的 legend：页面里还有其它 <div class=\"legend\">
 // （例如用量洞察的全价请求卡），用裸 legend 会切到错误位置或切出空串。
 const THEAD = slice(THEAD_HEAD + "'<div class=\"table-wrap\"><table><thead><tr>'",
