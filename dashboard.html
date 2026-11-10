@@ -4313,6 +4313,11 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
           </label>
         </div>
       </div>
+      <div id="loginVpcBox" style="display:none;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:16px">
+        <div style="font-size:12px;color:var(--dim);margin-bottom:8px;font-weight:600">企业 VPC（可选，仅国内版）</div>
+        <input id="loginVpc" type="text" placeholder="实例名，例如 acme" autocomplete="off" spellcheck="false">
+        <div class="hint" style="margin-top:6px">实例名或 acme.vpc.qoder.com.cn；留空走公网 qoder.com.cn。该值会随账号写入配置文件（<span class="mono">vpcEndpoint</span>）。</div>
+      </div>
       <div class="step" id="step1"><div class="n">1</div><div class="t" id="step1Text">正在申请授权登录链接…</div></div>
       <div class="step" id="step2"><div class="n">2</div><div class="t">在浏览器里打开下方链接并完成登录授权</div></div>
       <div id="loginLinkBox"></div>
@@ -4823,11 +4828,29 @@ function openLoginModal(){
   const rIntl = document.getElementById("radioIntl");
   if(rCn) rCn.checked = isCn;
   if(rIntl) rIntl.checked = !isCn;
+  syncLoginVpcBox();
   triggerLoginForSelectedRealm();
 }
 
 function switchLoginRealm(realm){
+  syncLoginVpcBox();
   triggerLoginForSelectedRealm();
+}
+
+/* VPC 只对企业版国内实例有意义：切到国际版就隐藏，并且不把它发上去。 */
+function syncLoginVpcBox(){
+  const checked = document.querySelector('input[name="loginRealm"]:checked');
+  const isCn = (checked ? checked.value : (window.VIEW_REALM || "cn")) === "cn";
+  const box = document.getElementById("loginVpcBox");
+  if(box) box.style.display = isCn ? "" : "none";
+}
+
+function loginVpcValue(){
+  const checked = document.querySelector('input[name="loginRealm"]:checked');
+  const isCn = (checked ? checked.value : (window.VIEW_REALM || "cn")) === "cn";
+  if(!isCn) return "";
+  const el = document.getElementById("loginVpc");
+  return el ? String(el.value || "").trim() : "";
 }
 
 function restartLogin(){
@@ -4858,7 +4881,10 @@ async function triggerLoginForSelectedRealm(){
   if(s1Text) s1Text.textContent = isCn ? "正在向 qoder.com.cn (国内版) 申请设备授权..." : "正在向 qoder.com (国际版) 申请设备授权...";
 
   try{
-    const r = await postJSON("/accounts/login/start", {platform: "CLI", realm: realm});
+    const vpc = loginVpcValue();
+    const r = await postJSON("/accounts/login/start",
+      vpc ? {platform: "CLI", realm: realm, vpc: vpc}
+          : {platform: "CLI", realm: realm});
     loginState = r.state;
     if(s1) s1.className = "step done";
     if(s2) s2.className = "step active";
@@ -6725,6 +6751,11 @@ function accountRow(a){
   const realmBadge = a.realm === 'cn'
     ? '<span class="realm-badge-cn">国内版</span>'
     : '<span class="realm-badge-intl">国际版</span>';
+  // 账号级企业 VPC：instance 名来自用户输入，进 HTML 前必须转义
+  const vpcBadge = a.vpcEndpoint
+    ? '<div style="margin-top:4px"><span class="realm-badge-cn" title="企业 VPC 实例：'
+      + esc(a.vpcEndpoint) + '（vpcEndpoint）">VPC</span></div>'
+    : '';
   // Inline handlers embed these in an HTML attribute, so they must survive
   // both the attribute and the quoted JS string. uid comes from an upstream
   // JWT; treat it as untrusted and keep it to a safe charset.
@@ -6794,7 +6825,7 @@ function accountRow(a){
     freshLine = '<div class="mono" style="font-size:10px;color:var(--dim);margin-top:2px">' + txt + '</div>';
   }
   return '<tr>'
-    + '<td style="text-align:center;white-space:nowrap">' + realmBadge + '</td>'
+    + '<td style="text-align:center;white-space:nowrap">' + realmBadge + vpcBadge + '</td>'
     + '<td style="text-align:left">'
     +   '<div style="font-weight:600;font-size:13px;color:var(--fg);display:flex;align-items:center;gap:6px;flex-wrap:wrap">'
     +     esc(a.nickname) + teamBadge(a) + checkinBadge(a) + '</div>'
@@ -6817,6 +6848,7 @@ function accountRow(a){
     +     '<button class="sec mini" onclick="testAccount(&quot;' + uidAttr + '&quot;, this)">测试</button>'
     +     '<button class="sec mini" onclick="refreshOne(&quot;' + uidAttr + '&quot;, this)">刷新</button>'
     +     '<button class="sec mini" onclick="editAccountNote(&quot;' + uidAttr + '&quot;, this)">备注</button>'
+    +     (a.realm === 'cn' ? '<button class="sec mini" title="企业 VPC 实例名（留空回公网）。仅国内版" onclick="editAccountVpc(&quot;' + uidAttr + '&quot;, this)">VPC</button>' : '')
     +   '</div>'
     +   '<div style="display:flex;gap:4px;justify-content:center">'
     +     '<button class="sec mini" onclick="exportOne(&quot;' + uidAttr + '&quot;)">导出</button>'
@@ -6844,6 +6876,32 @@ async function editAccountNote(uid, btn){
     if(btn){ btn.disabled = false; btn.textContent = "备注"; }
   }
 }
+/* 账号级企业 VPC：写进账号文件的 vpcEndpoint，之后该账号的
+   openapi / gateway / website 全部走实例专属域。留空 = 回公网。 */
+async function editAccountVpc(uid, btn){
+  const cur = (window.ACCOUNTS || []).find(a => a.uid === uid);
+  const value = prompt(
+    "企业 VPC 实例名（例如 acme，或 acme.vpc.qoder.com.cn）。\n留空表示走公网 qoder.com.cn：",
+    (cur && cur.vpcEndpoint) || "");
+  if(value === null) return;
+  if(btn){ btn.disabled = true; btn.textContent = "保存中"; }
+  try{
+    const r = await postJSON("/accounts/set", {uid: uid, vpcEndpoint: String(value).trim()});
+    if(r.account){
+      if(window.ACCOUNTS){
+        const i = window.ACCOUNTS.findIndex(a => a.uid === uid);
+        if(i >= 0) window.ACCOUNTS[i] = r.account;
+      }
+      renderAccounts(); adminRenderOverview();
+      toast(r.account.vpcEndpoint ? ("已切到 VPC 实例 " + r.account.vpcEndpoint) : "已改回公网", "ok");
+    }
+  }catch(e){
+    toast("VPC 设置失败: " + e.message, "bad");
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = "VPC"; }
+  }
+}
+
 let _acctSearchTimer = null;
 function setAccountSearch(v){
   window.ACCT_SEARCH = String(v || "");
