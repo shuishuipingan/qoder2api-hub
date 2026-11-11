@@ -4580,7 +4580,8 @@ class AccountPool(object):
                 # 不能因此把已有的显式实例/显式公网配置丢掉。
                 if (account.vpc_setting is None
                         and existing.vpc_setting is not None
-                        and not existing.vpc_error):
+                        and not existing.vpc_error
+                        and account.realm == existing.realm):
                     account.vpc_setting = existing.vpc_setting
                     account.vpc_endpoint = existing.vpc_endpoint
                     account.vpc_source = existing.vpc_source
