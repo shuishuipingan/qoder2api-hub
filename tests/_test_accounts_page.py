@@ -69,6 +69,20 @@ check("行入场动画 + reduced-motion 降级",
 check("工具栏吸顶（滚动时仍可操作）",
       "#pageAccounts .toolbar{position:sticky" in _dash)
 
+print("[accounts] 企业 VPC 控件")
+check("OAuth 弹窗有 VPC 输入与强制公网选项",
+      'id="loginVpc"' in _dash and 'id="loginVpcForcePublic"' in _dash)
+check("OAuth 留空 = 继承默认，显式公网才发送 vpc 空串",
+      "else if(loginVpcForcePublicChecked()) payload.vpc = \"\"" in _dash)
+check("PAT 弹窗有 VPC 输入与强制公网选项",
+      'id="patVpc"' in _dash and 'id="patVpcForcePublic"' in _dash
+      and "syncPatVpcBox" in _dash)
+check("PAT 导入请求会带 vpc",
+      "const payload = {pat: pat, realm: realm};" in _dash
+      and "payload.vpc = vpc" in _dash)
+check("账号行显示 VPC 来源与配置错误",
+      "vpcSourceLabel" in _dash and "a.vpcError" in _dash)
+
 print("[accounts] 页面结构")
 check("账号页至少 3 个 section（左侧导航才有锚点）",
       _acct.count("<section") >= 3, _acct.count("<section"))

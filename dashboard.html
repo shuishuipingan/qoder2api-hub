@@ -4316,7 +4316,11 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
       <div id="loginVpcBox" style="display:none;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:16px">
         <div style="font-size:12px;color:var(--dim);margin-bottom:8px;font-weight:600">企业 VPC（可选，仅国内版）</div>
         <input id="loginVpc" type="text" placeholder="实例名，例如 acme" autocomplete="off" spellcheck="false">
-        <div class="hint" style="margin-top:6px">实例名或 acme.vpc.qoder.com.cn；留空走公网 qoder.com.cn。该值会随账号写入配置文件（<span class="mono">vpcEndpoint</span>）。</div>
+        <div class="hint" style="margin-top:6px">实例名或 acme.vpc.qoder.com.cn；留空继承 <span class="mono">QD_CN_VPC_ENDPOINT</span> 默认实例（没有默认则走公网）。</div>
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:12px;margin-top:8px;color:var(--dim)">
+          <input type="checkbox" id="loginVpcForcePublic">
+          <span>即使有默认实例也强制走公网 qoder.com.cn</span>
+        </label>
       </div>
       <div class="step" id="step1"><div class="n">1</div><div class="t" id="step1Text">正在申请授权登录链接…</div></div>
       <div class="step" id="step2"><div class="n">2</div><div class="t">在浏览器里打开下方链接并完成登录授权</div></div>
@@ -4369,12 +4373,22 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
                       border-radius:8px;padding:9px 12px;color:var(--fg);font:inherit">
         <div style="display:flex;gap:18px;flex-wrap:wrap">
           <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px">
-            <input type="radio" name="patRealm" value="cn" id="patRadioCn" checked>
+            <input type="radio" name="patRealm" value="cn" id="patRadioCn" checked onchange="syncPatVpcBox()">
             <span><b>国内版</b> (qoder.com.cn)</span>
           </label>
           <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px">
-            <input type="radio" name="patRealm" value="intl" id="patRadioIntl">
+            <input type="radio" name="patRealm" value="intl" id="patRadioIntl" onchange="syncPatVpcBox()">
             <span><b>国际版</b> (qoder.com)</span>
+          </label>
+        </div>
+        <div id="patVpcBox" style="display:none;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px 14px">
+          <div style="font-size:12px;color:var(--dim);margin-bottom:8px;font-weight:600">企业 VPC（可选，仅国内版）</div>
+          <input id="patVpc" type="text" placeholder="实例名，例如 acme" autocomplete="off" spellcheck="false"
+                 style="width:100%;background:var(--bg-primary);border:1px solid var(--line);border-radius:8px;padding:9px 12px;color:var(--fg);font:inherit">
+          <div class="hint" style="margin-top:6px">留空继承 <span class="mono">QD_CN_VPC_ENDPOINT</span> 默认实例；没有默认则走公网。</div>
+          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:12px;margin-top:8px;color:var(--dim)">
+            <input type="checkbox" id="patVpcForcePublic">
+            <span>即使有默认实例也强制走公网</span>
           </label>
         </div>
         <div id="patBody" style="min-height:20px"></div>
@@ -4828,6 +4842,10 @@ function openLoginModal(){
   const rIntl = document.getElementById("radioIntl");
   if(rCn) rCn.checked = isCn;
   if(rIntl) rIntl.checked = !isCn;
+  const vpc = document.getElementById("loginVpc");
+  if(vpc) vpc.value = "";
+  const force = document.getElementById("loginVpcForcePublic");
+  if(force) force.checked = false;
   syncLoginVpcBox();
   triggerLoginForSelectedRealm();
 }
@@ -4851,6 +4869,13 @@ function loginVpcValue(){
   if(!isCn) return "";
   const el = document.getElementById("loginVpc");
   return el ? String(el.value || "").trim() : "";
+}
+
+function loginVpcForcePublicChecked(){
+  const checked = document.querySelector('input[name="loginRealm"]:checked');
+  const isCn = (checked ? checked.value : (window.VIEW_REALM || "cn")) === "cn";
+  const el = document.getElementById("loginVpcForcePublic");
+  return isCn && !!(el && el.checked);
 }
 
 function restartLogin(){
@@ -4881,10 +4906,13 @@ async function triggerLoginForSelectedRealm(){
   if(s1Text) s1Text.textContent = isCn ? "正在向 qoder.com.cn (国内版) 申请设备授权..." : "正在向 qoder.com (国际版) 申请设备授权...";
 
   try{
-    const vpc = loginVpcValue();
-    const r = await postJSON("/accounts/login/start",
-      vpc ? {platform: "CLI", realm: realm, vpc: vpc}
-          : {platform: "CLI", realm: realm});
+    const payload = {platform: "CLI", realm: realm};
+    if(isCn){
+      const vpc = loginVpcValue();
+      if(vpc) payload.vpc = vpc;
+      else if(loginVpcForcePublicChecked()) payload.vpc = "";  // 显式公网；缺键 = 继承默认
+    }
+    const r = await postJSON("/accounts/login/start", payload);
     loginState = r.state;
     if(s1) s1.className = "step done";
     if(s2) s2.className = "step active";
@@ -6751,11 +6779,19 @@ function accountRow(a){
   const realmBadge = a.realm === 'cn'
     ? '<span class="realm-badge-cn">国内版</span>'
     : '<span class="realm-badge-intl">国际版</span>';
-  // 账号级企业 VPC：instance 名来自用户输入，进 HTML 前必须转义
+  // 账号级企业 VPC：instance 名来自用户输入，进 HTML 前必须转义。
+  // vpcSource 区分账号显式配置 / env 默认 / domain 迁移，避免误读。
+  const vpcSourceLabel = ({account: '账号配置', env: '环境默认',
+                           domain: 'domain 迁移', public: '公网',
+                           error: '配置错误'})[a.vpcSource] || '';
   const vpcBadge = a.vpcEndpoint
     ? '<div style="margin-top:4px"><span class="realm-badge-cn" title="企业 VPC 实例：'
-      + esc(a.vpcEndpoint) + '（vpcEndpoint）">VPC</span></div>'
-    : '';
+      + esc(a.vpcEndpoint) + '（来源：' + esc(vpcSourceLabel || 'vpcEndpoint')
+      + '）">VPC</span></div>'
+    : (a.vpcError
+      ? '<div style="margin-top:4px"><span class="realm-badge-intl" title="'
+        + esc(a.vpcError) + '">VPC 错误</span></div>'
+      : '');
   // Inline handlers embed these in an HTML attribute, so they must survive
   // both the attribute and the quoted JS string. uid comes from an upstream
   // JWT; treat it as untrusted and keep it to a safe charset.
@@ -6881,7 +6917,8 @@ async function editAccountNote(uid, btn){
 async function editAccountVpc(uid, btn){
   const cur = (window.ACCOUNTS || []).find(a => a.uid === uid);
   const value = prompt(
-    "企业 VPC 实例名（例如 acme，或 acme.vpc.qoder.com.cn）。\n留空表示走公网 qoder.com.cn：",
+    "企业 VPC 实例名（例如 acme，或 acme.vpc.qoder.com.cn）。\n"
+    + "留空表示显式走公网（不会继承 QD_CN_VPC_ENDPOINT 默认值）：",
     (cur && cur.vpcEndpoint) || "");
   if(value === null) return;
   if(btn){ btn.disabled = true; btn.textContent = "保存中"; }
@@ -7531,7 +7568,19 @@ function openPatImport(){
   const rIntl = document.getElementById('patRadioIntl');
   if(rCn) rCn.checked = (window.VIEW_REALM !== 'intl');
   if(rIntl) rIntl.checked = (window.VIEW_REALM === 'intl');
+  const vpc = document.getElementById('patVpc');
+  if(vpc) vpc.value = '';
+  const force = document.getElementById('patVpcForcePublic');
+  if(force) force.checked = false;
+  syncPatVpcBox();
   if(m) m.classList.add('show');
+}
+
+function syncPatVpcBox(){
+  const intl = !!(document.getElementById('patRadioIntl') &&
+                  document.getElementById('patRadioIntl').checked);
+  const box = document.getElementById('patVpcBox');
+  if(box) box.style.display = intl ? 'none' : '';
 }
 
 function closePatImport(){
@@ -7551,7 +7600,15 @@ async function doImportPat(btn){
   if(btn){ btn.disabled = true; btn.textContent = '导入中...'; }
   if(body) body.innerHTML = '<p class="hint">正在交换 jobToken 并拉取账号身份…</p>';
   try{
-    const r = await postJSON('/accounts/import/pat', {pat: pat, realm: realm});
+    const payload = {pat: pat, realm: realm};
+    if(realm === 'cn'){
+      const vpcEl = document.getElementById('patVpc');
+      const vpc = vpcEl ? String(vpcEl.value || '').trim() : '';
+      const force = document.getElementById('patVpcForcePublic');
+      if(vpc) payload.vpc = vpc;
+      else if(force && force.checked) payload.vpc = '';
+    }
+    const r = await postJSON('/accounts/import/pat', payload);
     const a = (r.imported || [])[0] || {};
     if(body) body.innerHTML = '<p class="hint" style="color:#26bb82">✓ 已导入 ' + esc(a.nickname || (a.uid||'').slice(0,8)) + ' 到 ' + (realm === 'cn' ? '国内版' : '国际版') + '</p>';
     toast('已导入 ' + (a.nickname || (a.uid||'').slice(0,8)) + ' 到 ' + (realm === 'cn' ? '国内版' : '国际版'));
