@@ -134,6 +134,7 @@ Redis 仅开放 Compose 内部网络，数据由专用命名卷保存。
 | `ACCOUNTS_DIR` | `./accounts` | 账号目录 |
 | `QD_PROXY_USAGE_DIR` | `./usage` | 用量目录 |
 | `QD_PROXY_DEFAULT_REALM` | `cn` | 首次启动时的全局出口（`cn` / `intl`）。之后在看板切换的结果会保存下来 |
+| `QD_CN_VPC_ENDPOINT` | — | 国内版企业 VPC 的**默认实例**（实例名或实例域）。账号 `vpcEndpoint` 缺省时继承；显式实例覆盖；显式空串走公网。见[企业 VPC](accounts.md#企业-vpc-专属域cn) |
 | `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` | — | 访问上游时使用的代理，见[出口代理](deployment.md#出口代理) |
 | `QD_MAX_PAYLOAD_BYTES` | `52428800` | 客户端请求体大小上限（50 MB） |
 | `QD_MAX_BODY_MB` | `29` | 发往上游的请求体（编码后）上限，单位 MiB。超过时本地直接返回 413，不发请求、不影响账号。上游网关对单个请求体有约 30MB 的硬限制 |

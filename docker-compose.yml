@@ -27,8 +27,9 @@ services:
       # - API_KEY=your_api_key_here
       # ↑ 留空：容器以 --lan 启动，首次自动生成随机 Key 写入 ./accounts/settings.json
       #   并打印在日志（docker compose logs qoder-proxy | grep -i "api key"）
-      # 企业 VPC（仅 CN）不再用环境变量：在面板「添加账号」里填，或改账号
-      # JSON 的 vpcEndpoint。老部署无需迁移（domain 已是实例域，会自动识别）。
+      # 企业 VPC（仅 CN）：env 只作为默认值；账号 vpcEndpoint 显式覆盖。
+      # 也可以在面板「添加账号」里填，或改账号 JSON 的 vpcEndpoint。
+      # - QD_CN_VPC_ENDPOINT=acme
       - TZ=Asia/Shanghai
     volumes:
       # 持久化挂载账号凭证与用量流水
