@@ -14709,9 +14709,12 @@ def main():
     log("credential : %s" % (rep.path if rep else "-"))
     log("account    : %s @ %s" % (rep.uid if rep else "-",
                                   rep.domain if rep else "-"))
+    try:
+        _realm_domain = qoder_accounts.realm_config_for(CURRENT_REALM).get("domain")
+    except qoder_accounts.VpcConfigError:
+        _realm_domain = "INVALID_VPC_ENDPOINT"
     log("realm      : %s (%s)" % (
-        CURRENT_REALM,
-        get_realm_config(CURRENT_REALM).get("domain") or "qoder.com.cn"))
+        CURRENT_REALM, _realm_domain or "qoder.com.cn"))
     _vpc_accounts = [a for a in (POOL.accounts if POOL else [])
                      if getattr(a, "vpc_endpoint", "")]
     if _vpc_accounts:
