@@ -1,13 +1,15 @@
 """账号级企业 VPC（vpcEndpoint）套件。
 
-判据：VPC 从「全局环境变量」下沉到「账号配置文件」之后，
-  1. 带 vpcEndpoint 的 CN 账号，openapi / gateway / website / domain 全部
+判据：
+  1. 显式 vpcEndpoint 的 CN 账号，openapi / gateway / website / domain 全部
      走实例专属域，且**不回退**到公网 api1/api2/api3；
-  2. 该值随账号 JSON 落盘，重新加载后仍生效（save/load 往返）；
-  3. 国际版不认这个字段（脏配置被清空，端点不变）；
-  4. 账号的 VPC 主机只对自己的三个域名放宽 SSRF 校验，别的 vpc 域名照旧拒绝；
-  5. 没有 vpcEndpoint 的账号，行为与加这个功能之前**逐字节一致**；
-  6. 面板接口：/accounts/login/start 接受 vpc，但 intl+vpc 直接 400。
+  2. 三态：缺键继承 env、空串显式公网、实例名显式覆盖；非法值 fail-closed；
+  3. 落盘往返：显式值写入，继承值不写字段；
+  4. 国际版不认这个字段；
+  5. SSRF 白名单只放行账号实例的三个主机，且删除账号后会重建；
+  6. 设备授权 / PAT 导入按同一实例绑定；
+  7. 导入/预览/导出保留 vpcEndpoint，冲突数据拒绝；
+  8. CLI 扫描实例目录并在导入时保留来源实例。
 
     python tests/_test_vpc_account.py
 """
@@ -56,22 +58,50 @@ check("不回退公网（gateway_fallbacks 为空）",
 check("推理候选只有一个主机",
       A.gateway_candidates("cn", cfg) == ["https://acme-gateway.vpc.qoder.com.cn"],
       A.gateway_candidates("cn", cfg))
+check("来源标记为 account", acc.vpc_source == "account", acc.vpc_source)
 
-print("\n[vpc-account] 2) 接受三种写法 / 非法值安全回退")
+print("\n[vpc-account] 2) 接受三种写法 / 非法值 fail-closed")
 for raw, want in (("acme", "acme"),
                   ("acme.vpc.qoder.com.cn", "acme"),
                   ("https://acme-gateway.vpc.qoder.com.cn/", "acme")):
     got = A.realm_config_for("cn", raw)["vpc_instance"]
     check("写法 %r -> 实例 %r" % (raw, want), got == want, got)
-for bad in ("", "  ", "bad value", "acme/../evil", "1.2.3.4", "a" * 70):
-    resolved = A.realm_config_for("cn", bad)
-    check("非法值 %r 回退公网" % (bad,),
-          resolved["gateway"] == BASE_CN["gateway"], resolved["gateway"])
-check("非法 vpcEndpoint 的账号不抛异常",
-      cn_account(vpcEndpoint="bad value").realm_config()["gateway"]
-      == BASE_CN["gateway"])
+for bad in ("bad value", "acme/../evil", "1.2.3.4", "a" * 70):
+    try:
+        A.realm_config_for("cn", bad)
+        raised = False
+    except A.VpcConfigError:
+        raised = True
+    check("非法值 %r 抛 VpcConfigError" % (bad,), raised)
+for blank in ("", "  "):
+    check("空值 %r = 显式公网" % (blank,),
+          A.realm_config_for("cn", blank)["gateway"] == BASE_CN["gateway"])
+bad_acct = cn_account(vpcEndpoint="bad value")
+check("非法 vpcEndpoint 的账号不抛构造异常", bool(bad_acct.vpc_error),
+      bad_acct.vpc_error)
+check("非法账号 ready() 被挡住", not bad_acct.ready())
+check("非法账号 inference_eligible() 为假", not bad_acct.inference_eligible())
+check("非法账号 checkin_eligible() 为假", not bad_acct.checkin_eligible())
+try:
+    bad_acct.realm_config()
+    raised = False
+except A.VpcConfigError:
+    raised = True
+check("非法账号 realm_config() 抛错，不回退公网", raised)
+bad_dir = tempfile.mkdtemp(prefix="qd-vpc-bad-")
+with open(os.path.join(bad_dir, "bad.json"), "w", encoding="utf-8") as fh:
+    json.dump({"uid": "bad-loaded", "realm": "cn", "accessToken": "dt-x",
+               "vpcEndpoint": "bad value"}, fh)
+bad_pool = A.AccountPool(bad_dir)
+loaded = bad_pool.load()
+check("坏账号加载后仍保留（面板可修）",
+      [a.uid for a in loaded] == ["bad-loaded"], [a.uid for a in loaded])
+check("坏账号加载后带 vpcError", bool(loaded[0].vpc_error), loaded[0].vpc_error)
+check("坏账号不会被 representative 选中",
+      bad_pool.representative() is None,
+      bad_pool.representative())
 
-print("\n[vpc-account] 3) 落盘往返")
+print("\n[vpc-account] 3) 落盘往返：显式写入 / 继承不写字段")
 tmp = tempfile.mkdtemp(prefix="qd-vpc-acct-")
 saved = cn_account(vpcEndpoint="acme")
 path = saved.save(tmp)
@@ -87,11 +117,22 @@ check("public() 暴露 vpcEndpoint（面板靠它画 VPC 徽标）",
       reloaded.public().get("vpcEndpoint"))
 check("保存后 domain 已写成实例域", reloaded.domain == "acme.vpc.qoder.com.cn",
       reloaded.domain)
+inherit = cn_account()
+inherit_path = inherit.save(tmp)
+inherit_disk = json.loads(open(inherit_path, encoding="utf-8").read())
+check("继承账号不写 vpcEndpoint 字段", "vpcEndpoint" not in inherit_disk,
+      inherit_disk.get("vpcEndpoint", "<present>"))
+explicit_public = cn_account(vpcEndpoint="")
+public_path = explicit_public.save(tmp)
+public_disk = json.loads(open(public_path, encoding="utf-8").read())
+check("显式公网写空字符串", public_disk.get("vpcEndpoint") == "",
+      public_disk.get("vpcEndpoint"))
 
-print("\n[vpc-account] 3b) 老账号从 domain 反推实例（无 vpcEndpoint 字段）")
+print("\n[vpc-account] 3b) 老账号从 domain 反推实例 / 非法 domain")
 legacy = A.Account({"uid": "vpc-legacy", "realm": "cn", "accessToken": "x",
                     "domain": "acme.vpc.qoder.com.cn"})
 check("从 domain 推出实例名", legacy.vpc_endpoint == "acme", legacy.vpc_endpoint)
+check("来源标记为 domain", legacy.vpc_source == "domain", legacy.vpc_source)
 check("推理走实例 gateway",
       legacy.realm_config()["gateway"] == "https://acme-gateway.vpc.qoder.com.cn",
       legacy.realm_config()["gateway"])
@@ -104,7 +145,14 @@ check("公网 domain 仍是公网 gateway",
       public_dom.realm_config()["gateway"])
 odd_dom = A.Account({"uid": "vpc-odd", "realm": "cn", "accessToken": "x",
                      "domain": "-bad.vpc.qoder.com.cn"})
-check("非法实例域不产生 VPC", odd_dom.vpc_endpoint == "", odd_dom.vpc_endpoint)
+check("非法实例域标记 vpcError", bool(odd_dom.vpc_error), odd_dom.vpc_error)
+check("非法实例域不回退公网", not odd_dom.ready())
+conflict = A.Account({"uid": "vpc-conflict", "realm": "cn", "accessToken": "x",
+                      "domain": "fixture-a.vpc.qoder.com.cn",
+                      "vpcEndpoint": "fixture-b"})
+check("显式 vpc 与 domain 冲突时标记错误",
+      bool(conflict.vpc_error) and "conflicts" in conflict.vpc_error,
+      conflict.vpc_error)
 
 print("\n[vpc-account] 4) 国际版不认 VPC")
 intl = A.Account({"uid": "vpc-intl", "realm": "intl", "accessToken": "x",
@@ -123,10 +171,10 @@ check("gateway 仍是公网", plain.realm_config()["gateway"] == BASE_CN["gatewa
 check("candidates 仍是单主机公网",
       A.gateway_candidates("cn", plain.realm_config()) == [BASE_CN["gateway"]],
       A.gateway_candidates("cn", plain.realm_config()))
-check("to_dict 写出空字符串而不是缺字段",
-      plain.to_dict().get("vpcEndpoint") == "", plain.to_dict().get("vpcEndpoint"))
+check("to_dict 不写继承字段",
+      "vpcEndpoint" not in plain.to_dict(), plain.to_dict().get("vpcEndpoint"))
 
-print("\n[vpc-account] 6) SSRF 白名单只放行该账号的三个主机")
+print("\n[vpc-account] 6) SSRF 白名单 / 重建")
 check("实例三域名被登记",
       all(A.is_configured_vpc_host(h) for h in (
           "acme.vpc.qoder.com.cn", "acme-openapi.vpc.qoder.com.cn",
@@ -142,6 +190,14 @@ try:
 except ValueError:
     blocked = True
 check("通用规则照旧拦本机地址", blocked)
+other = cn_account(uid="vpc-other", vpcEndpoint="fixture-b")
+A.rebuild_vpc_hosts([acc, other])
+check("重建后 A/B 都登记",
+      A.is_configured_vpc_host("acme.vpc.qoder.com.cn")
+      and A.is_configured_vpc_host("fixture-b.vpc.qoder.com.cn"))
+A.rebuild_vpc_hosts([acc])
+check("账号移除后旧实例主机不再放行",
+      not A.is_configured_vpc_host("fixture-b.vpc.qoder.com.cn"))
 
 print("\n[vpc-account] 7) AccountPool.set_vpc 校验")
 pool_dir = tempfile.mkdtemp(prefix="qd-vpc-pool-")
@@ -165,8 +221,17 @@ except ValueError:
     raised2 = True
 check("国际版账号拒绝设置 VPC", raised2)
 check("set_vpc 未知 uid 返回 None", pool.set_vpc("nope", "acme") is None)
+check("set_vpc 空串显式公网",
+      (pool.set_vpc("vpc-uid-1", "") or {}).get("vpcEndpoint") == "")
+pool.set_vpc("vpc-uid-1", "acme")
+re_added = A.Account({"uid": "vpc-uid-1", "realm": "cn",
+                      "accessToken": "dt-relogin"})
+pool.add(re_added)
+check("重新登录不带 vpcEndpoint 时保留已有实例",
+      pool.get("vpc-uid-1").vpc_endpoint == "acme",
+      pool.get("vpc-uid-1").vpc_endpoint)
 
-print("\n[vpc-account] 8) 设备授权用实例域名")
+print("\n[vpc-account] 8) 设备授权用实例域名 / 非法值拒绝")
 login_pool = A.AccountPool(tempfile.mkdtemp(prefix="qd-vpc-login-"))
 started = login_pool.start_login(realm="cn", vpc="acme")
 check("authUrl 指向实例 website",
@@ -178,9 +243,130 @@ check("login 记录保留 vpc（poll 必须用同一实例）",
 plain_login = login_pool.start_login(realm="cn")
 check("不带 vpc 时仍走公网 website",
       plain_login["authUrl"].startswith("https://qoder.com.cn/"), plain_login["authUrl"])
+try:
+    login_pool.start_login(realm="cn", vpc="bad value")
+    raised = False
+except ValueError:
+    raised = True
+check("start_login 非法 vpc 抛错", raised)
+try:
+    login_pool.start_login(realm="intl", vpc="acme")
+    raised = False
+except ValueError:
+    raised = True
+check("start_login intl+vpc 拒绝", raised)
+
+print("\n[vpc-account] 9) PAT 导入绑定实例 / 非法值不出站")
+seen = []
 
 
-print("\n[vpc-account] 9) /accounts/login/start 接口")
+def fake_http(url, **kwargs):
+    seen.append(url)
+    if "jobToken" in url:
+        return {"token": "dt-pat", "expires_in": 3600000}
+    return {"id": "pat-user", "name": "PAT"}
+
+
+orig_http = A.http_json
+A.http_json = fake_http
+try:
+    pat_account = login_pool.import_pat("pt-fixture", realm="cn", vpc="acme")
+    check("PAT 交换走实例 openapi",
+          seen and seen[0].startswith("https://acme-openapi.vpc.qoder.com.cn/"),
+          seen[:1])
+    check("PAT 账号绑定实例", pat_account.vpc_endpoint == "acme",
+          pat_account.vpc_endpoint)
+    before = len(seen)
+    try:
+        login_pool.import_pat("pt-fixture", realm="cn", vpc="bad value")
+        raised = False
+    except A.VpcConfigError:
+        raised = True
+    check("PAT 非法 vpc 抛错且不出站", raised and len(seen) == before, len(seen) - before)
+    try:
+        login_pool.import_pat("pt-fixture", realm="intl", vpc="acme")
+        raised = False
+    except ValueError:
+        raised = True
+    check("PAT intl+vpc 拒绝", raised)
+finally:
+    A.http_json = orig_http
+
+print("\n[vpc-account] 10) 导入/预览/导出保留 vpcEndpoint")
+row = {"uid": "imp-vpc", "realm": "cn", "accessToken": "dt-x",
+       "vpcEndpoint": "fixture-a"}
+kw = A.normalise_import_row(row)
+check("导入 kwargs 保留 vpcEndpoint", kw.get("vpcEndpoint") == "fixture-a", kw)
+check("导入 domain 同步到实例域",
+      kw.get("domain") == "fixture-a.vpc.qoder.com.cn", kw.get("domain"))
+imp = A.Account(kw)
+check("导入账号走实例 gateway",
+      imp.realm_config()["gateway"] == "https://fixture-a-gateway.vpc.qoder.com.cn",
+      imp.realm_config()["gateway"])
+conflict_row = {"uid": "imp-conflict", "realm": "cn", "accessToken": "dt-x",
+                "domain": "fixture-a.vpc.qoder.com.cn",
+                "vpcEndpoint": "fixture-b"}
+try:
+    A.normalise_import_row(conflict_row)
+    raised = False
+except ValueError:
+    raised = True
+check("导入 domain/vpc 冲突被拒绝", raised)
+preview = A.AccountPool(tempfile.mkdtemp(prefix="qd-vpc-import-")).preview_import_rows([row])
+check("预览识别为可新增", preview["added"] == ["imp-vpc"], preview)
+import_pool = A.AccountPool(tempfile.mkdtemp(prefix="qd-vpc-import2-"))
+report = import_pool.import_rows([row])
+check("实际入库成功", report["added"] == ["imp-vpc"], report)
+check("入库账号仍绑定实例",
+      import_pool.get("imp-vpc").realm_config()["gateway"]
+      == "https://fixture-a-gateway.vpc.qoder.com.cn")
+export_doc = A.build_export_document(import_pool.accounts)
+check("导出包含 vpcEndpoint",
+      export_doc["accounts"][0].get("vpcEndpoint") == "fixture-a",
+      export_doc["accounts"][0].get("vpcEndpoint"))
+roundtrip = A.normalise_import_row(export_doc["accounts"][0])
+check("导出再导入端点一致",
+      roundtrip.get("vpcEndpoint") == "fixture-a"
+      and roundtrip.get("domain") == "fixture-a.vpc.qoder.com.cn", roundtrip)
+
+print("\n[vpc-account] 11) 扫描实例 CLI 目录并保留来源实例")
+home = tempfile.mkdtemp(prefix="qd-vpc-home-")
+old_home = os.environ.get("HOME")
+os.environ["HOME"] = home
+try:
+    public_dir = os.path.join(home, ".qoder-cn", ".auth")
+    acme_dir = os.path.join(home, ".qoder-cn", ".vpc", "acme", ".auth")
+    os.makedirs(public_dir)
+    os.makedirs(acme_dir)
+    with open(os.path.join(public_dir, "user"), "w", encoding="utf-8") as fh:
+        json.dump({"access_token": "jt-public", "uid": "scan-public",
+                   "name": "public"}, fh)
+    with open(os.path.join(acme_dir, "user"), "w", encoding="utf-8") as fh:
+        json.dump({"access_token": "jt-acme", "uid": "scan-acme",
+                   "name": "acme"}, fh)
+    detected = A.scan_desktop_credentials(vpc="acme")
+    cli = [d for d in detected if d.get("kind") == "cli" and d.get("realm") == "cn"]
+    check("扫描到公网 .auth", any(d.get("uid") == "scan-public" for d in cli),
+          [(d.get("uid"), d.get("vpcEndpoint")) for d in cli])
+    check("扫描到实例 .vpc/acme/.auth", any(d.get("uid") == "scan-acme" for d in cli),
+          [(d.get("uid"), d.get("vpcEndpoint")) for d in cli])
+    acme_item = next(d for d in cli if d.get("uid") == "scan-acme")
+    check("实例扫描项带来源实例", acme_item.get("vpcEndpoint") == "acme",
+          acme_item.get("vpcEndpoint"))
+    scan_pool = A.AccountPool(tempfile.mkdtemp(prefix="qd-vpc-scan-"))
+    imported = A.import_desktop_credential(
+        path=acme_item["path"], realm="cn", vpc="acme")
+    check("导入实例凭证绑定来源实例",
+          scan_pool.get(imported.uid).vpc_endpoint == "acme"
+          if scan_pool.get(imported.uid) else False,
+          scan_pool.get(imported.uid).vpc_endpoint if scan_pool.get(imported.uid) else None)
+finally:
+    if old_home is None:
+        os.environ.pop("HOME", None)
+    else:
+        os.environ["HOME"] = old_home
+
+print("\n[vpc-account] 12) 面板接口：非法 / intl+vpc 返回 400")
 pool.accounts = [cn_account(vpcEndpoint="")]
 P.POOL = pool
 
@@ -196,9 +382,9 @@ threading.Thread(target=srv.serve_forever, daemon=True).start()
 PORT = srv.server_address[1]
 
 
-def post(payload):
+def post(path, payload):
     req = urllib.request.Request(
-        "http://127.0.0.1:%d/accounts/login/start" % PORT,
+        "http://127.0.0.1:%d%s" % (PORT, path),
         data=json.dumps(payload).encode(), method="POST",
         headers={"Content-Type": "application/json", "X-Panel-Token": "t"})
     try:
@@ -213,17 +399,26 @@ def post(payload):
 
 
 try:
-    code, body = post({"realm": "cn", "vpc": "acme"})
+    code, body = post("/accounts/login/start", {"realm": "cn", "vpc": "acme"})
     check("cn + vpc -> 200", code == 200, code)
     check("返回的 authUrl 是实例域",
           str(body.get("authUrl", "")).startswith(
               "https://acme.vpc.qoder.com.cn/"), body.get("authUrl"))
-    code2, body2 = post({"realm": "cn"})
-    check("cn 不带 vpc -> 公网域名",
+    code2, body2 = post("/accounts/login/start", {"realm": "cn"})
+    check("cn 不带 vpc -> 公网域名（env 未设）",
           code2 == 200 and str(body2.get("authUrl", "")).startswith(
               "https://qoder.com.cn/"), body2.get("authUrl"))
-    code3, _ = post({"realm": "intl", "vpc": "acme"})
+    code3, _ = post("/accounts/login/start", {"realm": "intl", "vpc": "acme"})
     check("intl + vpc -> 400（国际版没有实例域）", code3 == 400, code3)
+    code4, _ = post("/accounts/login/start", {"realm": "cn", "vpc": "bad value"})
+    check("cn + 非法 vpc -> 400", code4 == 400, code4)
+    code5, _ = post("/accounts/set", {"uid": "vpc-uid-1", "vpcEndpoint": "bad value"})
+    check("/accounts/set 非法 vpc -> 400", code5 == 400, code5)
+    code6, _ = post("/accounts/import/pat", {"pat": "pt-x", "realm": "intl",
+                                             "vpc": "acme"})
+    check("/accounts/import/pat intl+vpc -> 400", code6 == 400, code6)
+    code7, _ = post("/accounts/import/desktop", {"vpc": "bad value"})
+    check("/accounts/import/desktop 非法 vpc -> 400", code7 == 400, code7)
 finally:
     srv.shutdown()
     srv.server_close()

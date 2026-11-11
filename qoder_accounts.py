@@ -307,16 +307,33 @@ def parse_vpc_endpoint(value):
     }
 
 
-# 企业 VPC 一律按**账号**配置（账号文件里的 vpcEndpoint），不再读环境变量。
+# 企业 VPC：账号级 vpcEndpoint 优先，缺省继承 QD_CN_VPC_ENDPOINT。
 #
-# 为什么可以直接停用 QD_CN_VPC_ENDPOINT：它只影响 REALM_CONFIGS 的初始
-# 域名字符串，而账号**落盘时 domain 已经写成实例域**（acme.vpc.qoder.com.cn）。
-# 新代码在 Account.__init__ 里从 domain 反推实例名（_vpc_instance_from_domain），
-# 所以老部署升级后行为不变，无需手工迁移。
+# 三态语义（docs/accounts.md 有完整说明）：
+#   None / 缺键  -> 继承环境变量默认实例（没有默认则公网）
+#   ""          -> 显式走公网
+#   "acme"      -> 显式实例
+#   其它        -> VpcConfigError；调用方必须 fail closed，不能回退公网。
 #
-# 仍然检测它是否被设置：静默忽略会让人以为还生效，明确告警才能让人知道
-# 该去面板改。VPC_ENV_DEPRECATED 由 qoder_proxy 在启动时读取并打印。
-VPC_ENV_DEPRECATED = bool(str(os.environ.get("QD_CN_VPC_ENDPOINT") or "").strip())
+# 环境变量只在**缺省**时生效，账号显式配置永远覆盖它。非法环境变量不会
+# 阻止进程启动，但继承它的账号会被标记 vpcError 并排除出站，避免企业凭证
+# 被发到公网。
+class VpcConfigError(ValueError):
+    """VPC 配置非法；调用方必须 fail closed，不能当作未配置。"""
+
+
+def _load_env_vpc():
+    raw = os.environ.get("QD_CN_VPC_ENDPOINT")
+    if raw is None or not str(raw).strip():
+        return None, ""
+    try:
+        return parse_vpc_endpoint(raw), ""
+    except ValueError as exc:
+        return None, str(exc)
+
+
+_VPC_ENV_CONFIG, VPC_ENV_ERROR = _load_env_vpc()
+VPC_ENV_CONFIGURED = _VPC_ENV_CONFIG is not None or bool(VPC_ENV_ERROR)
 
 # 账号级 vpcEndpoint 解析出的三个主机（SSRF 白名单）。账号文件本来就是
 # 可信输入（里面就有 access token），从这里登记域名不放宽任何"请求里可
@@ -325,27 +342,64 @@ _VPC_HOSTS = set()
 _VPC_HOSTS_LOCK = threading.Lock()
 
 
-def register_vpc_hosts(value):
-    """解析一个 VPC 实例名/域名，并把它的三个主机并入 SSRF 白名单。
-
-    返回 parse_vpc_endpoint 的结果；空值或非法值返回 None（调用方按
-    "没有 VPC 覆盖"处理，不抛异常——账号文件里的脏值不该让整池加载失败）。
-    """
-    try:
-        parsed = parse_vpc_endpoint(value)
-    except ValueError:
-        return None
-    if not parsed:
-        return None
+def _hosts_from_parsed(parsed):
     hosts = []
     for key in ("website", "openapi", "gateway"):
         name = urllib.parse.urlsplit(str(parsed.get(key) or "")).hostname
         if name:
             hosts.append(name.lower())
+    return hosts
+
+
+def register_vpc_hosts(value, strict=False):
+    """解析一个 VPC 实例名/域名，并把它的三个主机并入 SSRF 白名单。
+
+    空值/显式公网返回 None；非法值在 ``strict`` 时抛 ValueError，否则返回
+    None 且**不登记任何主机**。需要 fail-closed 的调用方必须传 strict=True。
+    """
+    try:
+        parsed = parse_vpc_endpoint(value)
+    except ValueError:
+        if strict:
+            raise
+        return None
+    if not parsed:
+        return None
+    hosts = _hosts_from_parsed(parsed)
     if hosts:
         with _VPC_HOSTS_LOCK:
             _VPC_HOSTS.update(hosts)
     return parsed
+
+
+def rebuild_vpc_hosts(accounts=None, extra=()):
+    """按当前账号池 + 环境默认值重建 SSRF 白名单。
+
+    只增不减会让账号删除/换实例后旧主机永久放行；池加载、增删账号和
+    set_vpc 之后都必须调用这里。
+    """
+    if accounts is None:
+        pool = globals().get("_ACTIVE_POOL")
+        accounts = list(getattr(pool, "accounts", ()) or ())
+    values = []
+    if _VPC_ENV_CONFIG:
+        values.append(_VPC_ENV_CONFIG["instance"])
+    for account in accounts:
+        instance = str(getattr(account, "vpc_endpoint", "") or "").strip()
+        if instance and not getattr(account, "vpc_error", ""):
+            values.append(instance)
+    values.extend(str(v or "").strip() for v in extra if str(v or "").strip())
+    hosts = set()
+    for value in values:
+        try:
+            parsed = parse_vpc_endpoint(value)
+        except ValueError:
+            continue
+        if parsed:
+            hosts.update(_hosts_from_parsed(parsed))
+    with _VPC_HOSTS_LOCK:
+        _VPC_HOSTS.clear()
+        _VPC_HOSTS.update(hosts)
 
 
 def vpc_config_for(value):
@@ -356,14 +410,41 @@ def vpc_endpoint_hosts():
     return _VPC_HOSTS
 
 
+def vpc_instance_from_host(host):
+    """从实例域反推实例名；非 VPC 域或非法 label 返回空串。"""
+    name = str(host or "").strip().strip("[]").lower()
+    if not name.endswith("." + VPC_DOMAIN_SUFFIX):
+        return ""
+    instance = name[:-len("." + VPC_DOMAIN_SUFFIX)]
+    if instance.endswith("-openapi"):
+        instance = instance[:-len("-openapi")]
+    elif instance.endswith("-gateway"):
+        instance = instance[:-len("-gateway")]
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,53}[a-z0-9])?", instance):
+        return ""
+    return instance
+
+
+def vpc_hosts_for_instance(instance):
+    """实例的三个官方主机；非法实例返回空 frozenset。"""
+    try:
+        parsed = parse_vpc_endpoint(instance)
+    except ValueError:
+        return frozenset()
+    if not parsed:
+        return frozenset()
+    return frozenset(_hosts_from_parsed(parsed))
+
+
 def is_configured_vpc_host(host):
-    """仅对**账号已配置**的 VPC 实例三个主机放行解析级 SSRF 校验。
+    """仅对**账号已配置/默认**的 VPC 实例三个主机放行解析级 SSRF 校验。
 
     企业 VPC 域名通常解析到公司内网地址，通用规则会把它当内网目标拒绝；
     但这是用户显式配置的固定主机，不是请求里可注入的 URL。
     """
     name = str(host or "").strip().strip("[]").lower()
-    return bool(name) and name in vpc_endpoint_hosts()
+    with _VPC_HOSTS_LOCK:
+        return bool(name) and name in _VPC_HOSTS
 
 
 REALM_CONFIGS = {
@@ -1300,7 +1381,8 @@ def openapi_candidates(realm, cfg=None):
     ``cfg`` 传账号自己的 realm 配置（`Account.realm_config()`）：账号级 VPC
     必须只走实例域，不能因为区域默认值把企业凭证发到公网。
     """
-    cfg = cfg or get_realm_config(realm)
+    if cfg is None:
+        cfg = realm_config_for(realm)
     r = str(realm or "cn")
     # 专属实例配置优先于遗留的 OPENAPI 覆盖；不得将企业凭据先送往公网。
     if cfg.get("vpc_instance"):
@@ -1331,32 +1413,13 @@ def _vpc_instance_from_domain(domain):
     """acme.vpc.qoder.com.cn / acme-gateway.vpc.qoder.com.cn -> "acme"。
 
     只认 VPC 后缀；公网域名、空值、非法形态一律返回 ""（表示没有 VPC）。
+    长度规则与 parse_vpc_endpoint 一致（55 字符），避免 domain 能反推、
+    端点解析却失败后静默回公网。
     """
-    host = str(domain or "").strip().strip("[]").lower()
-    if not host.endswith("." + VPC_DOMAIN_SUFFIX):
-        return ""
-    instance = host[:-len("." + VPC_DOMAIN_SUFFIX)]
-    if instance.endswith("-openapi"):
-        instance = instance[:-len("-openapi")]
-    elif instance.endswith("-gateway"):
-        instance = instance[:-len("-gateway")]
-    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", instance):
-        return ""
-    return instance
+    return vpc_instance_from_host(domain)
 
 
-def realm_config_for(realm, vpc=None):
-    """按**账号级** vpcEndpoint 覆盖该区域的端点；没有则等价 get_realm_config。
-
-    VPC 是企业实例专属，只对国内版有意义：国际版传了也忽略，避免把
-    intl 账号指到一个 cn 域名上。
-    """
-    cfg = get_realm_config(realm)
-    if realm != "cn":
-        return cfg
-    parsed = vpc_config_for(vpc)
-    if not parsed:
-        return cfg
+def _vpc_config_with(cfg, parsed):
     out = dict(cfg)
     out.update({
         "openapi": parsed["openapi"],
@@ -1370,13 +1433,59 @@ def realm_config_for(realm, vpc=None):
     return out
 
 
+def realm_config_for(realm, vpc=None):
+    """解析该区域实际端点。
+
+    ``vpc=None`` 表示“账号没有显式配置”，继承 QD_CN_VPC_ENDPOINT；``vpc=""``
+    表示显式公网；其它值必须是合法实例名/域名。非法值抛 VpcConfigError，
+    **绝不**静默回退公网。
+
+    VPC 是企业实例专属，只对国内版有意义：国际版忽略 vpc，避免把 intl
+    账号指到一个 cn 域名上。
+    """
+    cfg = get_realm_config(realm)
+    if realm != "cn":
+        return cfg
+    if vpc is None:
+        if VPC_ENV_ERROR:
+            raise VpcConfigError(
+                "invalid QD_CN_VPC_ENDPOINT: %s" % VPC_ENV_ERROR)
+        if _VPC_ENV_CONFIG:
+            return _vpc_config_with(cfg, _VPC_ENV_CONFIG)
+        return cfg
+    raw = str(vpc).strip()
+    if not raw:
+        return cfg
+    try:
+        parsed = parse_vpc_endpoint(raw)
+    except ValueError as exc:
+        raise VpcConfigError(str(exc))
+    return _vpc_config_with(cfg, parsed)
+
+
+def normalize_vpc_setting(value):
+    """把 API/文件里的 vpc 值规范成 None（继承）/ ""（公网）/ 实例名。"""
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return ""
+    try:
+        parsed = parse_vpc_endpoint(raw)
+    except ValueError as exc:
+        raise VpcConfigError(str(exc))
+    return parsed["instance"]
+
+
 def gateway_candidates(realm, cfg=None):
     """该区域的推理主机候选列表（官方客户端同款：主选 + 故障切换域名）。
 
     签名只覆盖 path，因此同一请求换主机后签名依旧有效。
-    ``cfg`` 传入账号自己的 realm 配置（可带 VPC 覆盖），不传则用区域默认。
+    ``cfg`` 传入账号自己的 realm 配置（可带 VPC 覆盖），不传则解析区域默认
+    （含 QD_CN_VPC_ENDPOINT，非法时抛 VpcConfigError）。
     """
-    cfg = cfg or get_realm_config(realm)
+    if cfg is None:
+        cfg = realm_config_for(realm)
     out = [cfg["gateway"]]
     # 企业 VPC 只有实例专属推理域，公网 api1/api2/api3 不能作为故障回退。
     if cfg.get("vpc_instance"):
@@ -1790,35 +1899,60 @@ def _proxy_map_from_env():
 
 
 class _VpcRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """VPC 请求只允许在本实例的 HTTPS 默认端口之间重定向。"""
+    """VPC 请求只允许在**源请求所属实例**的 HTTPS 默认端口之间重定向。
+
+    不能用全局已登记主机集合：多实例下 A 的 302 只要跳到 B，urllib 就会
+    复制原始 Authorization 头，等于把 A 的企业 token 发给 B。
+    """
+
+    def __init__(self, allowed_hosts=None):
+        super().__init__()
+        self.allowed_hosts = (
+            frozenset(str(h).strip().lower() for h in allowed_hosts if h)
+            if allowed_hosts is not None else None)
+
+    def _allowed_for_source(self, source_host):
+        if not is_configured_vpc_host(source_host):
+            return None          # 非 VPC 请求保持 urllib 原有行为
+        instance = vpc_instance_from_host(source_host)
+        if not instance:
+            return frozenset()   # 源是 VPC 域但推导失败 -> fail closed
+        if self.allowed_hosts is not None:
+            if str(source_host or "").strip().lower() not in self.allowed_hosts:
+                return frozenset()
+            return self.allowed_hosts
+        return vpc_hosts_for_instance(instance)
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         source = urllib.parse.urlsplit(req.full_url)
-        if is_configured_vpc_host(source.hostname):
+        allowed_hosts = self._allowed_for_source(source.hostname)
+        if allowed_hosts is not None:
             target = urllib.parse.urlsplit(newurl)
             try:
                 allowed = (target.scheme == "https"
                            and target.port in (None, 443)
                            and target.username is None and target.password is None
-                           and is_configured_vpc_host(target.hostname))
+                           and str(target.hostname or "").lower() in allowed_hosts)
             except ValueError:
                 allowed = False
             if not allowed:
-                raise urllib.error.HTTPError(req.full_url, code,
-                                             "VPC redirect outside configured instance",
-                                             headers, fp)
+                raise urllib.error.HTTPError(
+                    req.full_url, code,
+                    "VPC redirect outside this instance", headers, fp)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def _opener_for_request():
+def _opener_for_request(allowed_hosts=None):
     """每请求现建 opener：代理 = 当前环境变量（空 = 直连）。
 
     「现建」是对 #27 固化行为的修复——默认 opener（urllib.request.urlopen）
     首次使用时缓存代理配置；本函数让每次请求看到的环境变化立即生效。
+    ``allowed_hosts`` 可显式指定本次请求允许的重定向主机；默认按源 URL
+    所属实例收敛。
     """
     proxies = _proxy_map_from_env()
     return urllib.request.build_opener(urllib.request.ProxyHandler(proxies),
-                                       _VpcRedirectHandler())
+                                       _VpcRedirectHandler(allowed_hosts))
 
 
 def upstream_clock_skew(timeout=4.0):
@@ -1899,27 +2033,39 @@ class Account(object):
         # issue #69：账号备注（纯展示，不参与任何判定）
         self.note = str(data.get("note") or "")
         self.group = str(data.get("group") or "").strip()
-        # 账号级企业 VPC（仅国内版）：实例名（acme）或实例域名。空 = 走公网。
+        # 账号级企业 VPC（仅国内版），三态：
+        #   缺键/None -> 继承 QD_CN_VPC_ENDPOINT
+        #   ""       -> 显式公网
+        #   "acme"   -> 显式实例
         # 必须在 domain 默认值之前解析——domain 的兜底值取自 VPC 域名。
-        self.vpc_endpoint = str(data.get("vpcEndpoint") or "").strip()
+        self.vpc_setting = None
+        self.vpc_endpoint = ""
+        self.vpc_source = "public"
+        self.vpc_error = ""
+        if "vpcEndpoint" in data and data.get("vpcEndpoint") is not None:
+            self.vpc_setting = str(data.get("vpcEndpoint")).strip()
         self.domain = str(data.get("domain") or "")
         self.realm = str(data.get("realm") or detect_realm_from_domain(self.domain))
         if self.realm not in REALM_CONFIGS:
             self.realm = "cn"
-        if self.realm != "cn" and self.vpc_endpoint:
-            # 国际版没有实例专属域：脏配置不该把账号带到 cn 域名上。
-            self.vpc_endpoint = ""
-        if not self.vpc_endpoint and self.realm == "cn":
-            # 老账号只有 domain（导入/VPC 客户端登录时就带着实例域），没有
-            # vpcEndpoint 字段。从 domain 反推实例名：否则这类账号的推理会
-            # 被发到**公网** gateway，而它的 token 只对实例域有效 —— 上游
-            # 的观感就是"Login expired"，查半天查不出原因。
-            self.vpc_endpoint = _vpc_instance_from_domain(self.domain)
-        # 无条件解析一次：顺带把该账号的 VPC 主机登记进 SSRF 白名单
-        # （realm_config_for -> vpc_config_for -> register_vpc_hosts）。
-        _cfg = self.realm_config()
+        if self.realm != "cn":
+            # 国际版没有实例专属域：文件里的脏值直接忽略，API 层会 400。
+            self.vpc_setting = None
+            self.vpc_source = "public"
+        else:
+            self._resolve_vpc()
+        # 解析一次：既校验配置，也把合法实例登记进 SSRF 白名单。配置错误
+        # 不阻止账号加载，但后续 realm_config() 会抛错，ready()/签到/推理
+        # 一律排除，绝不再回退公网。
+        _cfg = None
+        if not self.vpc_error:
+            try:
+                _cfg = self.realm_config()
+            except VpcConfigError as exc:
+                self.vpc_error = str(exc)
+                self.vpc_source = "error"
         if not self.domain:
-            self.domain = _cfg["domain"]
+            self.domain = (_cfg or get_realm_config(self.realm))["domain"]
         self.platform = str(data.get("platform") or "CLI")
         self.access_token = str(data.get("accessToken") or "")
         self.refresh_token = str(data.get("refreshToken") or "")
@@ -2008,22 +2154,83 @@ class Account(object):
         self.machine_headers_state = MACHINE_HEADERS_OMITTED
 
     # -- 持久化 ------------------------------------------------------------
+    def _resolve_vpc(self):
+        """把 vpc_setting 解析成实际实例；非法值只标记错误，不抛异常。
+
+        加载账号不能让一个脏字段拖垮整个池，但后续所有凭证出站都必须走
+        realm_config() 的 fail-closed 检查。
+        """
+        if self.vpc_setting is None:
+            derived = _vpc_instance_from_domain(self.domain)
+            if derived:
+                # 老账号只有实例 domain：迁移成显式实例，避免以后 env 变化
+                # 把它带回公网。
+                self.vpc_setting = derived
+                self.vpc_endpoint = derived
+                self.vpc_source = "domain"
+            elif self.domain.lower().endswith("." + VPC_DOMAIN_SUFFIX):
+                self.vpc_error = "invalid VPC domain: %r" % self.domain
+                self.vpc_source = "error"
+            elif VPC_ENV_ERROR:
+                self.vpc_error = (
+                    "invalid QD_CN_VPC_ENDPOINT: %s" % VPC_ENV_ERROR)
+                self.vpc_source = "error"
+            elif _VPC_ENV_CONFIG:
+                self.vpc_endpoint = _VPC_ENV_CONFIG["instance"]
+                self.vpc_source = "env"
+                # 公网/空 domain 跟随默认实例；显式实例 domain 已在上面
+                # 走 derived 分支。
+                if not self.domain or not _vpc_instance_from_domain(self.domain):
+                    self.domain = _VPC_ENV_CONFIG["domain"]
+            else:
+                self.vpc_source = "public"
+        else:
+            raw = str(self.vpc_setting).strip()
+            self.vpc_setting = raw
+            if not raw:
+                self.vpc_source = "public"
+                if _vpc_instance_from_domain(self.domain):
+                    self.vpc_error = (
+                        "vpcEndpoint is empty (public) but domain points to "
+                        "a VPC instance: %r" % self.domain)
+                    self.vpc_source = "error"
+            else:
+                try:
+                    parsed = parse_vpc_endpoint(raw)
+                except ValueError as exc:
+                    self.vpc_error = str(exc)
+                    self.vpc_source = "error"
+                else:
+                    existing = _vpc_instance_from_domain(self.domain)
+                    if existing and existing != parsed["instance"]:
+                        self.vpc_error = (
+                            "vpcEndpoint %r conflicts with domain %r"
+                            % (parsed["instance"], self.domain))
+                        self.vpc_source = "error"
+                    else:
+                        self.vpc_endpoint = parsed["instance"]
+                        self.domain = parsed["domain"]
+                        self.vpc_source = "account"
+        if self.vpc_endpoint and not self.vpc_error:
+            register_vpc_hosts(self.vpc_endpoint)
+
     def realm_config(self):
         """本账号实际使用的区域端点（含账号级 VPC 覆盖）。
 
         账号内所有 openapi / gateway / website 的取值都必须走这里，别直接
-        调 get_realm_config(self.realm) —— 后者只认全局环境变量。
+        调 get_realm_config(self.realm) —— 那样会绕过账号级 VPC。
         """
-        return realm_config_for(self.realm, getattr(self, "vpc_endpoint", ""))
+        if self.vpc_error:
+            raise VpcConfigError(self.vpc_error)
+        return realm_config_for(self.realm, self.vpc_setting)
 
     def to_dict(self):
-        return {
+        data = {
             "uid": self.uid,
             "nickname": self.nickname,
             "group": self.group,
             "domain": self.domain,
             "realm": self.realm,
-            "vpcEndpoint": self.vpc_endpoint,
             "platform": self.platform,
             "accessToken": self.access_token,
             "refreshToken": self.refresh_token,
@@ -2049,10 +2256,15 @@ class Account(object):
             "organizationName": self.organization_name,
             "note": self.note,
         }
+        # 继承环境变量默认值时**不写字段**：否则第一次 save 就会变成
+        # “显式公网”，把 env 默认值永久覆盖掉。
+        if self.vpc_setting is not None:
+            data["vpcEndpoint"] = self.vpc_setting
+        return data
 
     def inference_eligible(self):
-        """能否接推理流量：启用 + 有凭证（历史语义，未改）。"""
-        return bool(self.enabled and self.access_token)
+        """能否接推理流量：启用 + 有凭证 + VPC 配置合法。"""
+        return bool(self.enabled and self.access_token and not self.vpc_error)
 
     def checkin_eligible(self):
         """能否参与签到/领福利（issue #102）。
@@ -2062,7 +2274,7 @@ class Account(object):
         凭证失效（无 access_token）一律不参与——signin 必然失败，还会用退化
         响应覆盖余额快照。过期判定由调用方（调度器 stale_uids）负责。
         """
-        if not self.access_token:
+        if not self.access_token or self.vpc_error:
             return False
         return bool(self.enabled or self.checkin_when_disabled)
 
@@ -2106,7 +2318,12 @@ class Account(object):
             "group": self.group,
             "domain": self.domain,
             "realm": self.realm,
+            # 实际生效的实例（继承 env 时也显示默认实例，面板据此画徽标）；
+            # vpcSource 区分 account/env/domain/public/error，避免把默认值
+            # 误认为账号显式配置。
             "vpcEndpoint": self.vpc_endpoint,
+            "vpcSource": self.vpc_source,
+            "vpcError": self.vpc_error,
             "platform": self.platform,
             "enabled": bool(self.enabled),
             "source": self.source,
@@ -2200,7 +2417,7 @@ class Account(object):
 
     # -- 健康与冷却 --------------------------------------------------------
     def ready(self, model=None):
-        if not self.enabled or not self.access_token:
+        if not self.enabled or not self.access_token or self.vpc_error:
             return False
         if self.cooldown_until > time.time():
             return False
@@ -4235,6 +4452,8 @@ class CreditsUsageRefresher(object):
                 continue
             if not a.enabled or not a.access_token:
                 continue
+            if getattr(a, "vpc_error", ""):
+                continue
             if float(getattr(a, "credits_refresh_next", 0) or 0) > now:
                 continue
             out.append(a)
@@ -4306,6 +4525,7 @@ class AccountPool(object):
         with self._lock:
             self.accounts = []
             if not os.path.isdir(self.dir):
+                rebuild_vpc_hosts([])
                 return self.accounts
             for name in sorted(os.listdir(self.dir)):
                 if not name.endswith(".json"):
@@ -4321,6 +4541,11 @@ class AccountPool(object):
                     continue
                 if account.uid:
                     self.accounts.append(account)
+                    if account.vpc_error:
+                        # 保留账号让面板可修；推理/签到由 ready() 等排除。
+                        self.log("account %s VPC config error: %s"
+                                 % (account.uid[:8], account.vpc_error))
+            rebuild_vpc_hosts(self.accounts)
             return self.accounts
 
     def list_public(self, realm=None, group=None):
@@ -4351,10 +4576,24 @@ class AccountPool(object):
                     account.last_checkin = existing.last_checkin
                 if not account.personal_token and existing.personal_token:
                     account.personal_token = existing.personal_token
+                # 重新登录/重新导入同一 uid 时，新记录通常不带 vpcEndpoint；
+                # 不能因此把已有的显式实例/显式公网配置丢掉。
+                if (account.vpc_setting is None
+                        and existing.vpc_setting is not None
+                        and not existing.vpc_error):
+                    account.vpc_setting = existing.vpc_setting
+                    account.vpc_endpoint = existing.vpc_endpoint
+                    account.vpc_source = existing.vpc_source
+                    account.vpc_error = ""
+                    try:
+                        account.domain = account.realm_config()["domain"]
+                    except VpcConfigError:
+                        pass
                 self.accounts[self.accounts.index(existing)] = account
             else:
                 self.accounts.append(account)
             account.save(self.dir)
+            rebuild_vpc_hosts(self.accounts)
             return account
 
     def remove(self, uid):
@@ -4364,6 +4603,7 @@ class AccountPool(object):
                 return False
             account.delete()
             self.accounts.remove(account)
+            rebuild_vpc_hosts(self.accounts)
             return True
 
     # -- 限额护栏（task-61）------------------------------------------------
@@ -4663,7 +4903,8 @@ class AccountPool(object):
         with self._lock:
             candidates = [a for a in self.accounts
                           if (not realm or a.realm == realm)
-                          and (allowed_uids is None or a.uid in allowed_uids)]
+                          and (allowed_uids is None or a.uid in allowed_uids)
+                          and not getattr(a, "vpc_error", "")]
             for account in candidates:
                 if account.access_token:
                     return account
@@ -4692,13 +4933,21 @@ class AccountPool(object):
         if raw and account.realm != "cn":
             raise ValueError("VPC is only available for CN accounts")
         if raw:
-            parsed = register_vpc_hosts(raw)
+            parsed = register_vpc_hosts(raw, strict=True)
             if not parsed:
                 raise ValueError("invalid VPC endpoint: %r" % raw)
-            raw = parsed["instance"]
-        account.vpc_endpoint = raw
+            account.vpc_setting = parsed["instance"]
+            account.vpc_endpoint = parsed["instance"]
+            account.vpc_source = "account"
+        else:
+            # 面板上的“清空”是显式选择公网，不是继承 env 默认值。
+            account.vpc_setting = ""
+            account.vpc_endpoint = ""
+            account.vpc_source = "public"
+        account.vpc_error = ""
         account.domain = account.realm_config()["domain"]
         account.save(self.dir)
+        rebuild_vpc_hosts(self.accounts)
         return account.public()
 
     def set_all_enabled(self, enabled, realm=None):
@@ -4797,7 +5046,10 @@ class AccountPool(object):
           Intl : challenge, challenge_method, nonce(32-hex), client_id,
                  machine_id（新协议带 client_id/machine_id、不带 redirect_uri）
         """
-        cfg = realm_config_for(realm, vpc)
+        vpc_setting = normalize_vpc_setting(vpc)
+        if realm != "cn" and vpc_setting not in (None, ""):
+            raise ValueError("VPC is only available for CN accounts")
+        cfg = realm_config_for(realm, vpc_setting)
         verifier, challenge = _make_pkce()
         nonce = uuid.uuid4().hex if not cfg["nonce_dashed"] else str(uuid.uuid4())
         q = {
@@ -4809,7 +5061,7 @@ class AccountPool(object):
             q["redirect_uri"] = cfg["redirect_uri"]
         if cfg.get("send_client_id"):
             q["client_id"] = cfg["client_id"]
-            q["machine_id"] = self._local_machine_id(realm, vpc)
+            q["machine_id"] = self._local_machine_id(realm, vpc_setting)
         auth_url = cfg["website"] + "/device/selectAccounts?" + urllib.parse.urlencode(q)
         state = "qd-%d" % time.time_ns()
         with self._lock:
@@ -4821,7 +5073,8 @@ class AccountPool(object):
                 "platform": platform,
                 # 账号级 VPC：poll 阶段必须用**同一个**实例的 openapi，
                 # 否则设备授权在 A 实例换 token 时被拿到 B 实例去兑。
-                "vpc": str(vpc or "").strip(),
+                # None = 继承 env；"" = 显式公网；实例名 = 显式覆盖。
+                "vpc": vpc_setting,
             }
         return {"state": state, "authUrl": auth_url, "realm": realm,
                 "platform": platform}
@@ -4902,7 +5155,7 @@ class AccountPool(object):
         except Exception:
             user_type, org_id, org_name = DEFAULT_USER_TYPE, "", ""
 
-        account = Account({
+        account_data = {
             "uid": uid or ("q-" + uuid.uuid4().hex[:24]),
             "nickname": nickname or ("u" + (uid[-8:] if uid else "")),
             "domain": cfg["domain"],
@@ -4916,7 +5169,10 @@ class AccountPool(object):
             "userType": user_type,
             "organizationId": org_id,
             "organizationName": org_name,
-        })
+        }
+        if info.get("vpc") is not None:
+            account_data["vpcEndpoint"] = info.get("vpc")
+        account = Account(account_data)
         self.add(account)
         with self._lock:
             self.logins.pop(state, None)
@@ -4932,7 +5188,10 @@ class AccountPool(object):
         pat = str(pat or "").strip()
         if not pat.startswith("pt-"):
             raise ValueError("PAT must start with pt-")
-        cfg = realm_config_for(realm, vpc)
+        vpc_setting = normalize_vpc_setting(vpc)
+        if realm != "cn" and vpc_setting not in (None, ""):
+            raise ValueError("VPC is only available for CN accounts")
+        cfg = realm_config_for(realm, vpc_setting)
         data = http_json(cfg["openapi"] + PATH_JOB_EXCHANGE,
                          data=json.dumps({"personal_token": pat}).encode(),
                          method="POST",
@@ -4961,12 +5220,11 @@ class AccountPool(object):
             exp = int(time.time() + int(data["expires_in"]) / 1000)
         else:
             exp = int(time.time()) + 24 * 3600
-        account = Account({
+        account_data = {
             "uid": uid or ("p-" + uuid.uuid4().hex[:24]),
             "nickname": nickname or ("u" + (uid[-8:] if uid else uid[:8])),
             "domain": cfg["domain"],
             "realm": realm,
-            "vpcEndpoint": str(vpc or "").strip(),
             "platform": "CLI",
             "accessToken": token,
             "refreshToken": data.get("refresh_token") or "",
@@ -4977,7 +5235,10 @@ class AccountPool(object):
             "userType": user_type,
             "organizationId": org_id,
             "organizationName": org_name,
-        })
+        }
+        if vpc_setting is not None:
+            account_data["vpcEndpoint"] = vpc_setting
+        account = Account(account_data)
         self.add(account)
         return account
 
@@ -5057,8 +5318,40 @@ def _load_cli_user(realm, path, machine_key):
     return json.loads(pt.decode("utf-8"))
 
 
-def scan_desktop_credentials():
-    """只读探测本机双区已登录凭证。返回候选列表（不含任何明文令牌）。"""
+def _scan_vpc_settings(vpc=None):
+    """扫描范围：显式 vpc > env 默认 + 已配置账号实例。
+
+    返回实例名列表；公网 ``.auth`` 由 scan_desktop_credentials 无条件扫描。
+    """
+    if vpc is not None:
+        values = vpc if isinstance(vpc, (list, tuple, set)) else [vpc]
+        out = []
+        for value in values:
+            setting = normalize_vpc_setting(value)
+            if setting and setting not in out:
+                out.append(setting)
+        return out
+    out = []
+    if _VPC_ENV_CONFIG and _VPC_ENV_CONFIG["instance"] not in out:
+        out.append(_VPC_ENV_CONFIG["instance"])
+    pool = globals().get("_ACTIVE_POOL")
+    for account in getattr(pool, "accounts", ()) or ():
+        if getattr(account, "realm", "") != "cn":
+            continue
+        if getattr(account, "vpc_error", ""):
+            continue
+        instance = str(getattr(account, "vpc_endpoint", "") or "")
+        if instance and instance not in out:
+            out.append(instance)
+    return out
+
+
+def scan_desktop_credentials(vpc=None):
+    """只读探测本机双区已登录凭证。返回候选列表（不含任何明文令牌）。
+
+    ``vpc`` 指定要额外扫描的实例（字符串或列表）；不传则扫描环境默认
+    实例 + 当前账号池里已配置的实例。公网 ``.auth`` 始终扫描。
+    """
     found = []
     for realm in ("intl", "cn"):
         cfg = get_realm_config(realm)
@@ -5070,6 +5363,7 @@ def scan_desktop_credentials():
             "realm": realm,
             "realmName": cfg["name"],
             "domain": cfg["domain"],
+            "vpcEndpoint": None,
             "readable": False,
             "valid": False,
             "uid": "",
@@ -5105,8 +5399,14 @@ def scan_desktop_credentials():
             item["error"] = str(exc)
         found.append(item)
 
-        # 2) CLI 端 user / user.{profile}（含 VPC 实例专属目录）
-        for auth_dir in cli_auth_dirs(realm):
+        # 2) CLI 端 user / user.{profile}（公网 + 实例专属目录）
+        root = os.path.join(os.path.expanduser("~"), cfg["home_dir"])
+        dirs = [(os.path.join(root, ".auth"), None)]
+        if realm == "cn":
+            for instance in _scan_vpc_settings(vpc):
+                dirs.append((os.path.join(root, ".vpc", instance, ".auth"),
+                             instance))
+        for auth_dir, source_vpc in dirs:
             if not os.path.isdir(auth_dir):
                 continue
             machine_key = ""
@@ -5121,6 +5421,8 @@ def scan_desktop_credentials():
                          if n == "user" or n.startswith("user.")]
             except Exception:
                 names = []
+            source_domain = (parse_vpc_endpoint(source_vpc)["domain"]
+                             if source_vpc else cfg["domain"])
             for n in names:
                 p = os.path.join(auth_dir, n)
                 cli_item = {
@@ -5129,7 +5431,8 @@ def scan_desktop_credentials():
                     "file": n,
                     "realm": realm,
                     "realmName": cfg["name"],
-                    "domain": cfg["domain"],
+                    "domain": source_domain,
+                    "vpcEndpoint": source_vpc,
                     "readable": False,
                     "valid": False,
                     "uid": "",
@@ -5155,33 +5458,42 @@ def scan_desktop_credentials():
     return found
 
 
-def import_desktop_credential(path=None, realm=None):
-    """把扫描到的凭证导入账号池。path=None 时导入扫描到的全部有效项。"""
+def import_desktop_credential(path=None, realm=None, vpc=None):
+    """把扫描到的凭证导入账号池。path=None 时导入扫描到的全部有效项。
+
+    CLI 实例目录里的凭证会绑定来源实例；公网 ``.auth`` 保持“继承 env 默认”
+    语义，避免老部署升级后新增导入突然改走公网。
+    """
     if not path:
         imported, errors = [], []
-        for item in scan_desktop_credentials():
+        for item in scan_desktop_credentials(vpc=vpc):
             if not item.get("valid"):
                 continue
             try:
                 imported.append(import_desktop_credential(
-                    path=item["path"], realm=item["realm"]))
+                    path=item["path"], realm=item["realm"],
+                    vpc=item.get("vpcEndpoint")))
             except Exception as exc:
                 errors.append("%s/%s: %s" % (item["realm"], item["file"], exc))
         if errors:
             raise RuntimeError("; ".join(errors[:3]))
         return imported
 
-    # 定位该 path 归属的 realm（按扫描结果匹配；否则按目录名猜）
+    # 定位该 path 归属的 realm 与来源实例（按扫描结果匹配）
     target_realm = realm
     matched = None
-    for item in scan_desktop_credentials():
+    for item in scan_desktop_credentials(vpc=vpc):
         if os.path.abspath(item["path"]) == os.path.abspath(path):
             matched = item
             target_realm = item["realm"]
             break
     if target_realm not in REALM_CONFIGS:
         target_realm = "cn"
-    cfg = get_realm_config(target_realm)
+    source_vpc = (matched.get("vpcEndpoint") if matched is not None
+                  else normalize_vpc_setting(vpc))
+    if source_vpc not in (None, "") and target_realm != "cn":
+        raise ValueError("VPC is only available for CN accounts")
+    cfg = realm_config_for(target_realm, source_vpc)
 
     token = refresh = ""
     uid = nickname = ""
@@ -5235,7 +5547,7 @@ def import_desktop_credential(path=None, realm=None):
         raise RuntimeError("credential has no access token")
     if not uid:
         uid = "d-" + uuid.uuid4().hex[:24]
-    account = Account({
+    account_data = {
         "uid": uid,
         "nickname": nickname or uid[:8],
         "domain": cfg["domain"],
@@ -5249,7 +5561,10 @@ def import_desktop_credential(path=None, realm=None):
         "userType": user_type,
         "organizationId": org_id,
         "organizationName": org_name,
-    })
+    }
+    if source_vpc is not None:
+        account_data["vpcEndpoint"] = source_vpc
+    account = Account(account_data)
     return add_to_pool(account)
 
 
@@ -5341,6 +5656,13 @@ def normalise_import_row(row, realm=None, group=None):
                 return layer.get(key)
         return default
 
+    def pick_raw(key):
+        """保留空串/None 的字段读取；vpcEndpoint 的空值有语义。"""
+        for layer in (row, auth, profile):
+            if isinstance(layer, dict) and key in layer:
+                return layer.get(key)
+        return None
+
     token = str(pick("accessToken") or "").strip()
     if not token:
         raise ValueError("no accessToken")
@@ -5348,6 +5670,36 @@ def normalise_import_row(row, realm=None, group=None):
     if detected not in ("cn", "intl"):
         detected = detect_realm_from_domain(pick("domain"))
     cfg = get_realm_config(detected)
+    domain_raw = str(pick("domain") or "").strip()
+    domain_instance = _vpc_instance_from_domain(domain_raw)
+    vpc_raw = pick_raw("vpcEndpoint")
+    vpc_setting = None
+    if vpc_raw is not None:
+        vpc_setting = normalize_vpc_setting(vpc_raw)
+        if detected != "cn" and vpc_setting not in (None, ""):
+            raise ValueError("VPC is only available for CN accounts")
+    if domain_raw.lower().endswith("." + VPC_DOMAIN_SUFFIX) and not domain_instance:
+        raise ValueError("invalid VPC domain: %r" % domain_raw)
+    if vpc_setting:
+        if domain_instance and domain_instance != vpc_setting:
+            raise ValueError(
+                "domain %r conflicts with vpcEndpoint %r"
+                % (domain_raw, vpc_setting))
+        domain_value = parse_vpc_endpoint(vpc_setting)["domain"]
+    elif vpc_setting == "":
+        if domain_instance:
+            raise ValueError(
+                "vpcEndpoint is empty (public) but domain points to instance %r"
+                % domain_instance)
+        domain_value = domain_raw or cfg["domain"]
+    elif domain_instance:
+        # 只有实例 domain 的老文档：迁移成显式实例，避免以后 env 变化
+        # 把它带回公网。
+        vpc_setting = domain_instance
+        domain_value = domain_raw
+    else:
+        # 没有 vpcEndpoint 也没有实例 domain：继承 env 默认值。
+        domain_value = domain_raw or cfg["domain"]
     raw_uid = str(pick("uid") or "").strip()
     uid = re.sub(r"[^A-Za-z0-9_-]", "_", raw_uid).strip("_ ")
     if not uid:
@@ -5360,11 +5712,11 @@ def normalise_import_row(row, realm=None, group=None):
     exp = normalize_epoch(pick("expiresAt"))
     if not exp:
         exp = int(time.time()) + 3600
-    return {
+    out = {
         "uid": uid,
         "nickname": str(pick("nickname") or ""),
         "group": str(group if group is not None else pick("group") or "").strip(),
-        "domain": str(pick("domain") or cfg["domain"]),
+        "domain": domain_value,
         "realm": detected,
         "platform": str(pick("platform") or "CLI"),
         "accessToken": token,
@@ -5379,3 +5731,6 @@ def normalise_import_row(row, realm=None, group=None):
         "lastError": "",
         "cooldownUntil": 0.0,
     }
+    if vpc_setting is not None:
+        out["vpcEndpoint"] = vpc_setting
+    return out

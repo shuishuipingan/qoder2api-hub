@@ -1,13 +1,13 @@
-"""企业 VPC 的**账号级**模型套件（v1.9.6 之后：环境变量已停用）。
+"""企业 VPC 的解析 / 环境默认 / 实例隔离套件。
 
 判据：
   1. 解析规则与 v1.9.6 的加固保持一致（实例名 / 三种官方域名；拒绝路径、端口、
      凭据、query、空端口、空 query 标记；实例名最长 55 字符）；
-  2. QD_CN_VPC_ENDPOINT 不再生效：设了也只留一条 WARN，区域端点保持公网；
-  3. SSRF 白名单只登记**账号显式配置**的实例，未登记的 vpc 域名照旧按公网
-     规则校验（解析到内网 -> 拒绝），fake-IP 与 IPv6 映射的判定不变；
-  4. 账号级 VPC 下：openapi 候选只有实例域、跨区域令牌诊断关闭、重定向只允许
-     本实例的 HTTPS 默认端口、CLI 凭据目录优先实例目录。
+  2. QD_CN_VPC_ENDPOINT 是**默认值**：账号缺省继承，显式实例覆盖，显式空串
+     走公网；非法环境变量不会启动退出，但继承账号 fail-closed；
+  3. SSRF 白名单只登记账号实际实例，未登记域名照旧按公网规则校验；
+  4. 重定向只允许源请求所属实例的三个主机，模型发现走同一隔离 opener；
+  5. CLI 凭据目录优先实例目录。
 
     python tests/_test_vpc_endpoint.py
 """
@@ -15,6 +15,8 @@ import json
 import os
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -94,45 +96,116 @@ check("CN openapi 候选不含 VPC 域",
 check("未登记时 is_configured_vpc_host 为 False",
       not A.is_configured_vpc_host("acme-openapi.vpc.qoder.com.cn"))
 
-print("\n[vpc] 4) 子进程：QD_CN_VPC_ENDPOINT 已失效（只告警，不改端点）")
+print("\n[vpc] 4) 子进程：环境变量是默认值，不是停用")
 CODE = r'''
 import json
 import qoder_accounts as A
-cn = A.get_realm_config("cn")
-print(json.dumps({
-    "deprecated": A.VPC_ENV_DEPRECATED,
-    "openapi": cn["openapi"], "gateway": cn["gateway"],
-    "website": cn["website"], "domain": cn["domain"],
-    "openapi_candidates": A.openapi_candidates("cn"),
-    "gateway_candidates": A.gateway_candidates("cn"),
-    "hosts": sorted(A.vpc_endpoint_hosts()),
-}, ensure_ascii=False))
+out = {"configured": A.VPC_ENV_CONFIGURED, "error": A.VPC_ENV_ERROR,
+       "base_openapi": A.get_realm_config("cn")["openapi"],
+       "base_gateway": A.get_realm_config("cn")["gateway"]}
+try:
+    default = A.realm_config_for("cn")
+    out["default_openapi"] = default["openapi"]
+    out["default_gateway"] = default["gateway"]
+    out["default_candidates"] = A.gateway_candidates("cn")
+except Exception as exc:
+    out["default_error"] = str(exc)
+inherit = A.Account({"uid": "inherit", "realm": "cn", "accessToken": "x"})
+out["inherit"] = {"vpc": inherit.vpc_endpoint, "source": inherit.vpc_source,
+                  "saved": "vpcEndpoint" in inherit.to_dict()}
+try:
+    out["inherit"]["gateway"] = inherit.realm_config()["gateway"]
+except Exception as exc:
+    out["inherit"]["error"] = str(exc)
+try:
+    public = A.Account({"uid": "public", "realm": "cn", "accessToken": "x",
+                        "vpcEndpoint": ""})
+    out["public"] = {"vpc": public.vpc_endpoint, "source": public.vpc_source,
+                     "gateway": public.realm_config()["gateway"]}
+except Exception as exc:
+    out["public_error"] = str(exc)
+try:
+    explicit = A.Account({"uid": "explicit", "realm": "cn", "accessToken": "x",
+                          "vpcEndpoint": "other"})
+    out["explicit"] = {"vpc": explicit.vpc_endpoint,
+                       "gateway": explicit.realm_config()["gateway"]}
+except Exception as exc:
+    out["explicit_error"] = str(exc)
+try:
+    import tempfile
+    pool = A.AccountPool(tempfile.mkdtemp(prefix="qd-vpc-env-login-"))
+    out["login_url"] = pool.start_login(realm="cn")["authUrl"]
+    A.http_json = lambda url, **kw: (
+        {"token": "dt-pat", "expires_in": 3600000}
+        if "jobToken" in url else {"id": "pat-user", "name": "PAT"})
+    pat = pool.import_pat("pt-fixture", realm="cn")
+    out["pat"] = {"vpc": pat.vpc_endpoint,
+                  "gateway": pat.realm_config()["gateway"]}
+except Exception as exc:
+    out["login_error"] = str(exc)
+print(json.dumps(out, ensure_ascii=False))
 '''
 data = json.loads(run_py(CODE, {"QD_CN_VPC_ENDPOINT": "acme"}))
-check("检测到旧变量仍被设置", data["deprecated"] is True, data["deprecated"])
-check("openapi 仍是公网（变量不再生效）",
-      data["openapi"] == "https://openapi.qoder.com.cn", data["openapi"])
-check("gateway 仍是公网",
-      data["gateway"] == "https://gateway.qoder.com.cn", data["gateway"])
-check("website 仍是公网", data["website"] == "https://qoder.com.cn",
-      data["website"])
-check("domain 仍是公网", data["domain"] == "qoder.com.cn", data["domain"])
-check("openapi 候选不含实例域",
-      not any("vpc.qoder.com.cn" in c for c in data["openapi_candidates"]),
-      data["openapi_candidates"])
-check("gateway 候选不含实例域",
-      data["gateway_candidates"] == ["https://gateway.qoder.com.cn"],
-      data["gateway_candidates"])
-check("旧变量不再往白名单塞主机", data["hosts"] == [], data["hosts"])
+check("检测到环境变量", data["configured"] is True, data["configured"])
+check("默认实例覆盖 realm_config_for",
+      data.get("default_gateway") == "https://acme-gateway.vpc.qoder.com.cn",
+      data.get("default_gateway"))
+check("候选默认也走实例域",
+      data.get("default_candidates") == ["https://acme-gateway.vpc.qoder.com.cn"],
+      data.get("default_candidates"))
+check("get_realm_config 仍是公网基线",
+      data["base_gateway"] == "https://gateway.qoder.com.cn", data["base_gateway"])
+check("缺省账号继承 env 实例",
+      data["inherit"]["vpc"] == "acme"
+      and data["inherit"]["source"] == "env"
+      and data["inherit"]["gateway"] == "https://acme-gateway.vpc.qoder.com.cn",
+      data.get("inherit"))
+check("继承账号保存不写 vpcEndpoint",
+      data["inherit"]["saved"] is False, data["inherit"])
+check("显式空串覆盖 env 走公网",
+      data["public"]["vpc"] == ""
+      and data["public"]["source"] == "public"
+      and data["public"]["gateway"] == "https://gateway.qoder.com.cn",
+      data.get("public"))
+check("显式实例覆盖 env",
+      data["explicit"]["gateway"] == "https://other-gateway.vpc.qoder.com.cn",
+      data.get("explicit"))
+check("新增 OAuth 默认走 env 实例",
+      data.get("login_url", "").startswith(
+          "https://acme.vpc.qoder.com.cn/device/selectAccounts"),
+      data.get("login_url"))
+check("新增 PAT 默认走 env 实例",
+      data.get("pat", {}).get("gateway")
+      == "https://acme-gateway.vpc.qoder.com.cn", data.get("pat"))
 
 plain = json.loads(run_py(CODE, {"QD_CN_VPC_ENDPOINT": ""}))
-check("未设置变量时没有告警", plain["deprecated"] is False, plain["deprecated"])
+check("未设置变量时没有默认",
+      plain["configured"] is False and plain["inherit"]["gateway"]
+      == "https://gateway.qoder.com.cn", plain.get("inherit"))
+check("未设置变量时新增 OAuth 走公网",
+      plain.get("login_url", "").startswith(
+          "https://qoder.com.cn/device/selectAccounts"),
+      plain.get("login_url"))
+check("未设置变量时新增 PAT 走公网",
+      plain.get("pat", {}).get("gateway")
+      == "https://gateway.qoder.com.cn", plain.get("pat"))
 
 bad_env = json.loads(run_py(CODE, {"QD_CN_VPC_ENDPOINT": "bad host"}))
-check("非法旧值也不会让进程起不来", bad_env["deprecated"] is True,
-      bad_env["deprecated"])
-check("非法旧值同样不改端点",
-      bad_env["gateway"] == "https://gateway.qoder.com.cn", bad_env["gateway"])
+check("非法旧值不会让进程起不来", bad_env["configured"] is True
+      and bad_env["error"], (bad_env["configured"], bad_env["error"]))
+check("非法 env：默认解析抛错",
+      "default_error" in bad_env, bad_env.get("default_error"))
+check("非法 env：继承账号 fail-closed",
+      bad_env["inherit"].get("source") == "error"
+      and bad_env["inherit"].get("vpc") == "", bad_env.get("inherit"))
+check("非法 env：显式实例仍可用",
+      bad_env["explicit"]["gateway"] == "https://other-gateway.vpc.qoder.com.cn",
+      bad_env.get("explicit"))
+check("非法 env：显式公网仍可用",
+      bad_env["public"]["gateway"] == "https://gateway.qoder.com.cn",
+      bad_env.get("public"))
+check("非法 env：新增 OAuth 明确报错，不静默回公网",
+      "login_error" in bad_env, bad_env.get("login_url"))
 
 print("\n[vpc] 5) 从账号 domain 反推实例（老账号升级路径）")
 DERIVE = {
@@ -144,6 +217,7 @@ DERIVE = {
     "": "",
     "-acme.vpc.qoder.com.cn": "",
     "acme.vpc.qoder.com.cn.evil.test": "",
+    ("a" * 60) + ".vpc.qoder.com.cn": "",
 }
 for domain, want in DERIVE.items():
     got = A._vpc_instance_from_domain(domain)
@@ -224,14 +298,16 @@ for name in ("accounts", "proxy"):
     check(name + " 拒绝 fake-IP 混入私网", not fake[name + "_private"])
     check(name + " 拒绝 translated 私网地址", not fake[name + "_mapped_private"])
 
-print("\n[vpc] 8) 账号级隔离：旧额度缓存 / 跨区诊断 / 重定向 / CLI 目录")
+print("\n[vpc] 8) 账号级隔离：重定向 / 模型发现 / 额度缓存 / CLI 目录")
 CODE_ISOLATION = r'''
-import json, os, tempfile, urllib.error, urllib.request
+import json, tempfile, urllib.error, urllib.request
 from unittest import mock
 import qoder_accounts as A
 
 account = A.Account({"uid": "fixture", "realm": "cn", "accessToken": "fixture-token",
                      "vpcEndpoint": "acme"})
+other = A.Account({"uid": "other", "realm": "cn", "accessToken": "other-token",
+                   "vpcEndpoint": "other"})
 seen = []
 def fake_http(url, **kwargs):
     seen.append(url)
@@ -244,14 +320,12 @@ with tempfile.TemporaryDirectory() as root:
             root, {"host": "https://openapi.qoder.com.cn",
                    "path": "/api/v2/quota/usage"})
         account.probe_credits_endpoints(root, limit=2)
-        instance_seen = list(seen)      # 只看本账号自己的出站
+        instance_seen = list(seen)
         before = len(seen)
         hint = account._other_realm_quota_hint()
-        # 账号级：只有本账号被关闭跨区探测；非 VPC 账号照旧允许（那是它的
-        # 正常诊断能力，不能因为别的账号是 VPC 就被连带关掉）。
         no_cross = len(seen) == before
-        other = A.Account({"uid": "other", "realm": "intl", "accessToken": "t"})
-        other._other_realm_quota_hint()
+        plain = A.Account({"uid": "plain", "realm": "intl", "accessToken": "t"})
+        plain._other_realm_quota_hint()
         non_vpc_probes = len(seen) > before
 handler = A._VpcRedirectHandler()
 req = urllib.request.Request("https://acme-openapi.vpc.qoder.com.cn/start",
@@ -259,8 +333,8 @@ req = urllib.request.Request("https://acme-openapi.vpc.qoder.com.cn/start",
 redirects = {}
 for label, url in (
     ("own", "https://acme.vpc.qoder.com.cn/next"),
-    ("public", "https://openapi.qoder.com.cn/next"),
     ("other", "https://other.vpc.qoder.com.cn/next"),
+    ("public", "https://openapi.qoder.com.cn/next"),
     ("http", "http://acme.vpc.qoder.com.cn/next"),
     ("port", "https://acme.vpc.qoder.com.cn:8443/next"),
 ):
@@ -301,5 +375,41 @@ with open(os.path.join(ROOT, "qoder_proxy.py"), encoding="utf-8") as fh:
 check("VPC 推理同样使用隔离重定向 opener",
       "resp = qoder_accounts._opener_for_request().open(req, timeout=600)"
       in inference_source)
+check("模型发现使用隔离 opener",
+      "qoder_accounts._opener_for_request().open(req, timeout=15)"
+      in inference_source)
+check("模型发现不再使用裸 urlopen",
+      "with urllib.request.urlopen(req, timeout=15) as resp:" not in inference_source)
+
+print("\n[vpc] 9) 跨实例重定向 A -> B 必须拒绝")
+A.Account({"uid": "a", "realm": "cn", "accessToken": "t", "vpcEndpoint": "fixture-a"})
+A.Account({"uid": "b", "realm": "cn", "accessToken": "t", "vpcEndpoint": "fixture-b"})
+handler = A._VpcRedirectHandler()
+req = urllib.request.Request(
+    "https://fixture-a-openapi.vpc.qoder.com.cn/x",
+    headers={"Authorization": "Bearer SECRET-A"})
+try:
+    new = handler.redirect_request(
+        req, None, 302, "Found", {},
+        "https://fixture-b-openapi.vpc.qoder.com.cn/y")
+    blocked = False
+except urllib.error.HTTPError:
+    blocked = True
+    new = None
+check("A -> B 被拒绝", blocked)
+check("A -> A 官网允许",
+      handler.redirect_request(req, None, 302, "Found", {},
+                               "https://fixture-a.vpc.qoder.com.cn/ok") is not None)
+explicit_handler = A._VpcRedirectHandler(
+    ["fixture-b.vpc.qoder.com.cn", "fixture-b-openapi.vpc.qoder.com.cn",
+     "fixture-b-gateway.vpc.qoder.com.cn"])
+try:
+    explicit_handler.redirect_request(
+        req, None, 302, "Found", {},
+        "https://fixture-b.vpc.qoder.com.cn/x")
+    explicit_blocked = False
+except urllib.error.HTTPError:
+    explicit_blocked = True
+check("显式 allowlist 与源实例不匹配时 fail closed", explicit_blocked)
 
 finish()

@@ -1328,6 +1328,9 @@ def _refreshable_accounts(accounts):
         if not a.access_token:
             skipped.append({"uid": a.uid, "reason": "no_credential"})
             continue
+        if getattr(a, "vpc_error", ""):
+            skipped.append({"uid": a.uid, "reason": "vpc_config_error"})
+            continue
         targets.append(a)
     return targets, skipped
 
@@ -3163,7 +3166,10 @@ def read_dynamic_models(realm=None):
             url = validate_public_http_url(raw_url)
             req = urllib.request.Request(url, data=sign_body.encode("utf-8"),
                                          method="GET", headers=headers)
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            # 必须和推理请求走同一个隔离 opener：裸 urlopen 不经过
+            # _VpcRedirectHandler，302 会把签名头和 Authorization 带到
+            # 其它实例甚至任意外部主机。
+            with qoder_accounts._opener_for_request().open(req, timeout=15) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
             break
         except Exception as exc:
@@ -7697,6 +7703,15 @@ def _in_container():
             or ("kubepods" in blob)
     except Exception:
         return False
+
+
+def _account_gateway_for_error(account):
+    """错误提示里的目标主机：VPC 账号必须显示实例域，而不是公网默认值。"""
+    try:
+        return account.realm_config()["gateway"]
+    except Exception:
+        return qoder_accounts.get_realm_config(
+            getattr(account, "realm", "cn"))["gateway"]
 
 
 def _friendly_net_error(exc, target=""):
@@ -12446,6 +12461,9 @@ class Handler(BaseHTTPRequestHandler):
                     "accounts": self._admin_account_views()})
             # Snapshot only the requested group; jobs never fall back to the whole pool.
             def worker(account):
+                if getattr(account, "vpc_error", ""):
+                    return {"uid": account.uid, "ok": False,
+                            "error": "VPC config error: %s" % account.vpc_error}
                 if action == "test":
                     return self._admin_test_account(account)
                 if action == "refresh":
@@ -12667,6 +12685,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not target:
                     return self._json(200, {"ok": False,
                                             "msg": "未找到指定的账号"})
+                if getattr(target, "vpc_error", ""):
+                    return self._json(200, {
+                        "ok": False,
+                        "msg": "账号 VPC 配置错误：%s" % target.vpc_error})
                 targets = [target]
             else:
                 # 不再按区域过滤：签到能力运行时探测，接口不存在的账号会在
@@ -12695,6 +12717,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not target:
                     return self._json(200, {"ok": False,
                                             "msg": "未找到指定的账号"})
+                if getattr(target, "vpc_error", ""):
+                    return self._json(200, {
+                        "ok": False,
+                        "msg": "账号 VPC 配置错误：%s" % target.vpc_error})
                 targets = [target]
             else:
                 # issue #102：签到与「是否接推理」解耦——禁用但开了
@@ -12837,13 +12863,20 @@ class Handler(BaseHTTPRequestHandler):
             target_realm = payload.get("realm") or CURRENT_REALM
             if target_realm not in ("intl", "cn"):
                 target_realm = "cn"
-            vpc = str(payload.get("vpc") or "").strip()
-            if vpc and target_realm != "cn":
+            # 缺键 = 继承 env 默认；"" = 显式公网；实例名 = 显式覆盖。
+            vpc = payload.get("vpc") if "vpc" in payload else None
+            try:
+                vpc_setting = qoder_accounts.normalize_vpc_setting(vpc)
+            except qoder_accounts.VpcConfigError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
+            if target_realm != "cn" and vpc_setting not in (None, ""):
                 return self._error(400, "VPC is only available for CN accounts",
                                    "invalid_request_error")
             try:
                 started = POOL.start_login(realm=target_realm,
-                                           platform=platform, vpc=vpc)
+                                           platform=platform, vpc=vpc_setting)
+            except qoder_accounts.VpcConfigError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
             except Exception as exc:
                 return self._error(502, "could not start login: %s" % exc)
             log("oauth device login started (realm=%s, state=%s)"
@@ -12857,10 +12890,17 @@ class Handler(BaseHTTPRequestHandler):
             realm = payload.get("realm") or CURRENT_REALM
             if realm not in ("intl", "cn"):
                 realm = "cn"
+            vpc = payload.get("vpc") if "vpc" in payload else None
+            try:
+                vpc_setting = qoder_accounts.normalize_vpc_setting(vpc)
+            except qoder_accounts.VpcConfigError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
+            if realm != "cn" and vpc_setting not in (None, ""):
+                return self._error(400, "VPC is only available for CN accounts",
+                                   "invalid_request_error")
             try:
                 account = POOL.import_pat(
-                    pat, realm=realm,
-                    vpc=str(payload.get("vpc") or "").strip())
+                    pat, realm=realm, vpc=vpc_setting)
             except Exception as exc:
                 return self._error(400, "PAT import failed: %s" % exc)
             log("imported PAT account %s (realm=%s)"
@@ -12871,11 +12911,16 @@ class Handler(BaseHTTPRequestHandler):
             # 两步确认：{} 只读扫描（双区：桌面 App auth.v1.dat + CLI user）；
             # {"path":...} 按确认导入该凭证；{"all":true} 导入全部有效项。
             target_path = payload.get("path")
+            scan_vpc = payload.get("vpc") if "vpc" in payload else None
+            try:
+                scan_vpc = qoder_accounts.normalize_vpc_setting(scan_vpc)
+            except qoder_accounts.VpcConfigError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
             if target_path:
                 realm = payload.get("realm")
                 try:
                     account = qoder_accounts.import_desktop_credential(
-                        path=target_path, realm=realm)
+                        path=target_path, realm=realm, vpc=scan_vpc)
                 except Exception as exc:
                     return self._error(400, "import failed: %s" % exc)
                 log("imported %s (%s) from local client credential"
@@ -12887,7 +12932,8 @@ class Handler(BaseHTTPRequestHandler):
                 })
             if payload.get("all"):
                 try:
-                    imported = qoder_accounts.import_desktop_credential()
+                    imported = qoder_accounts.import_desktop_credential(
+                        vpc=scan_vpc)
                 except Exception as exc:
                     return self._error(400, "import failed: %s" % exc)
                 for account in imported:
@@ -12899,7 +12945,8 @@ class Handler(BaseHTTPRequestHandler):
                     "pool_uids": [a.uid for a in POOL.accounts],
                 })
             try:
-                detected = qoder_accounts.scan_desktop_credentials()
+                detected = qoder_accounts.scan_desktop_credentials(
+                    vpc=scan_vpc)
             except Exception as exc:
                 detected = []
                 log("desktop credential scan failed: %s" % exc)
@@ -13015,8 +13062,7 @@ class Handler(BaseHTTPRequestHandler):
                     "ok": False, "uid": account.uid, "status": 500,
                     "error": _friendly_net_error(
                         exc,
-                        qoder_accounts.get_realm_config(
-                            acc_realm(account))["gateway"]),
+                        _account_gateway_for_error(account)),
                     "elapsed_ms": wall_ms})
         if path == "/accounts/set":
             uid = payload.get("uid")
@@ -14440,16 +14486,19 @@ def main():
                     help="write the server PID to this file (stop.bat uses it; "
                          "removed on exit)")
     args = ap.parse_args()
-    if qoder_accounts.VPC_ENV_DEPRECATED:
-        # 不再读这个变量。账号落盘时 domain 已是实例域，升级后行为不变；
-        # 但静默忽略会让人以为它还生效，所以明确说一次。
-        sys.stderr.write(
-            "[WARN] QD_CN_VPC_ENDPOINT is no longer supported: enterprise VPC "
-            "is configured per account now.\n"
-            "       Open the panel -> Accounts -> VPC button (or set "
-            "vpcEndpoint in the account JSON).\n"
-            "       Existing accounts keep working: their domain already "
-            "records the instance.\n")
+    if qoder_accounts.VPC_ENV_CONFIGURED:
+        if qoder_accounts.VPC_ENV_ERROR:
+            sys.stderr.write(
+                "[WARN] invalid QD_CN_VPC_ENDPOINT: %s\n"
+                "       Accounts without an explicit vpcEndpoint will be "
+                "marked VPC-error and excluded from inference until fixed.\n"
+                % qoder_accounts.VPC_ENV_ERROR)
+        else:
+            sys.stderr.write(
+                "[INFO] QD_CN_VPC_ENDPOINT default: %s\n"
+                "       Accounts without vpcEndpoint inherit it; an explicit "
+                "account vpcEndpoint (including empty = public) overrides.\n"
+                % qoder_accounts._VPC_ENV_CONFIG["instance"])
     qoder_logpaths.install_stream_logging(os.path.dirname(os.path.abspath(__file__)))
     if not args.usage_dir and not os.environ.get("QD_PROXY_USAGE_DIR"):
         _migration = qoder_logpaths.migrate_legacy_usage(

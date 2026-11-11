@@ -62,7 +62,10 @@ check("qoder_accounts.py 直连 urlopen 基线 == 0（出站统一走 _opener_fo
       n_direct == 0, n_direct)
 src_p = open(os.path.join(ROOT, "qoder_proxy.py"), encoding="utf-8").read()
 n_direct_p = src_p.count("urllib.request.urlopen(")
-check("qoder_proxy.py 直连 urlopen 基线 == 4（同上）", n_direct_p == 4, n_direct_p)
+# task-vpc 后 4 -> 3：模型发现改走账号级隔离 opener（_VpcRedirectHandler），
+# 不再裸 urlopen。剩余 3 处均为无账号凭证的公共请求（更新检查 / 公网推理分支 /
+# 本机 health 探活）。
+check("qoder_proxy.py 直连 urlopen 基线 == 3（同上）", n_direct_p == 3, n_direct_p)
 
 print("")
 print("SUMMARY: TOTAL %d checks, %d passed, %d failed" % (PASS + FAIL, PASS, FAIL))
